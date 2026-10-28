@@ -121,7 +121,8 @@ heartbeat() {
 # Solange ein Auftrag laeuft, alle FORGE_HB_INTERVAL s (60) einen Heartbeat schreiben (sonst "stale" bei langen Runs)
 HBPID=""
 hb_start() {
-  ( while kill -0 "$$" 2>/dev/null; do sleep "${FORGE_HB_INTERVAL:-60}" 9>&- & wait $!; kill -0 "$$" 2>/dev/null && heartbeat; done ) 9>&- &
+  # stdout/stderr/Lock-FD schliessen: ein verwaister sleep darf weder Pipes des Aufrufers noch den flock halten
+  ( while kill -0 "$$" 2>/dev/null; do sleep "${FORGE_HB_INTERVAL:-60}" >/dev/null 2>&1 9>&- & wait $!; kill -0 "$$" 2>/dev/null && heartbeat; done ) >/dev/null 2>&1 9>&- &
   HBPID=$!
 }
 hb_stop() {

@@ -54,6 +54,11 @@ c() { sed -n "s/^$1=//p" "$STUB_LOG.codex"; }
 [ "$(c AUTH)" = "Basic $exp" ] && [ -z "$(c TEL)" ] && ok "codex: FORGE_OTEL_AUTH gesetzt, keine Claude-Telemetrie" || bad "codex env"
 [ "$(c MCP)" = mcp-token-AAAA ] && ok "codex: FORGE_MCP_TOKEN" || bad "codex MCP"
 
+# Regression: der Heartbeat-Hintergrund darf Pipes des Aufrufers nicht offenhalten (subprocess capture_output haengt sonst bis zum sleep-Ende)
+echo hi > "$FORGE_BASE/post/eingang/BRIEF_forge-t9b.md"
+t0=$(date +%s); FORGE_HB_INTERVAL=30 bash "$WATCHER" --once 2>&1 | cat >/dev/null; el=$(( $(date +%s) - t0 ))
+[ "$el" -lt 15 ] && ok "Watcher-Lauf haelt keine Pipe offen (${el}s)" || bad "Pipe offen: ${el}s"
+
 # Trockenlauf: nur Namen + maskierte Werte
 out=$(bash -c '. "$1"; forge_exec_env_dryrun claude 2026T_BRIEF_x.md forge forge-x' _ "$HERE/../bin/forge-exec-env.sh")
 grep -q 'OTEL_EXPORTER_OTLP_HEADERS=<masked:' <<<"$out" && ! grep -q "$exp\|sk-lf-test\|mcp-token" <<<"$out" && ok "dryrun maskiert Geheimnisse" || bad "dryrun: $out"
