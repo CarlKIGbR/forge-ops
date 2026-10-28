@@ -27,6 +27,9 @@ CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 CODEX_BIN="${CODEX_BIN:-codex}"
 ONCE=0
 [ "${1:-}" = "--once" ] && ONCE=1
+# Executor-Umgebung (MCP-Token, spaeter OTEL) aus forge-exec-env.sh
+# shellcheck source=/dev/null
+. "$(dirname "${BASH_SOURCE[0]}")/forge-exec-env.sh" 2>/dev/null || forge_exec_env() { :; }
 
 umask 0002
 export PATH="${HOME:-/srv/forge/home}/.local/bin:$PATH"
@@ -215,7 +218,7 @@ process() {
     : > "$json"; printf '%s\n' "$skip" > "$err"
     printf '%s\n' "FEHLER: $skip" > "$body"
   else
-    ( cd "$WORK" && exec timeout "${FORGE_MAX_SECONDS:-14400}" "$bin" "${args[@]}" < "$EIN/$name" > "$json" 2> "$err" 9>&- ) &
+    ( forge_exec_env "$exec"; cd "$WORK" && exec timeout "${FORGE_MAX_SECONDS:-14400}" "$bin" "${args[@]}" < "$EIN/$name" > "$json" 2> "$err" 9>&- ) &
     CHILD=$!
     wait "$CHILD"; rc=$?
     # wait kann durch Signal unterbrochen werden -> erneut auf Ende warten
