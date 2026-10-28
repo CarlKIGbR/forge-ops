@@ -52,6 +52,7 @@ on_term() {
   STOP=1
   # laufenden Auftrag sauber beenden, nichts Neues beginnen
   [ -n "$CHILD" ] && kill -TERM "$CHILD" 2>/dev/null
+  hb_stop
 }
 trap on_term TERM INT
 
@@ -115,6 +116,17 @@ write_report() {
 
 heartbeat() {
   utcl > "$STATE/.heartbeat.tmp" && mv -f "$STATE/.heartbeat.tmp" "$STATE/heartbeat"
+}
+
+# Solange ein Auftrag laeuft, alle FORGE_HB_INTERVAL s (60) einen Heartbeat schreiben (sonst "stale" bei langen Runs)
+HBPID=""
+hb_start() {
+  ( while kill -0 "$$" 2>/dev/null; do sleep "${FORGE_HB_INTERVAL:-60}" 9>&- & wait $!; kill -0 "$$" 2>/dev/null && heartbeat; done ) 9>&- &
+  HBPID=$!
+}
+hb_stop() {
+  [ -n "$HBPID" ] || return 0
+  kill "$HBPID" 2>/dev/null; wait "$HBPID" 2>/dev/null; HBPID=""
 }
 
 # Naechsten faelligen Brief liefern (aeltester zuerst, mtime >= MIN_AGE s, keine Dotfiles)
@@ -218,12 +230,14 @@ process() {
     : > "$json"; printf '%s\n' "$skip" > "$err"
     printf '%s\n' "FEHLER: $skip" > "$body"
   else
-    ( forge_exec_env "$exec"; cd "$WORK" && exec timeout "${FORGE_MAX_SECONDS:-14400}" "$bin" "${args[@]}" < "$EIN/$name" > "$json" 2> "$err" 9>&- ) &
+    ( forge_exec_env "$exec" "${ts}_$name" "${k%%-*}" "$k"; cd "$WORK" && exec timeout "${FORGE_MAX_SECONDS:-14400}" "$bin" "${args[@]}" < "$EIN/$name" > "$json" 2> "$err" 9>&- ) &
     CHILD=$!
+    hb_start
     wait "$CHILD"; rc=$?
     # wait kann durch Signal unterbrochen werden -> erneut auf Ende warten
     while kill -0 "$CHILD" 2>/dev/null; do wait "$CHILD"; rc=$?; done
     CHILD=""
+    hb_stop
     if [ -s "$json" ]; then
       if [ "$exec" = codex ]; then
         newsid=$(codex_parse "$json" thread)
