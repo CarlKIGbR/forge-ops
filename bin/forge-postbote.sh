@@ -3,12 +3,17 @@
 # Laeuft als User "forge". Nimmt Briefe aus eingang/, ruft "claude -p" auf,
 # schreibt Reports nach ausgang/. Strikt sequentiell (flock), Poll alle 5 s.
 #
-# Dateiname: <ART>_<K>[.fortsetzung][.modell-<id>].md
+# Dateiname: <ART>_<K>[.fortsetzung][.exec-<claude|codex>][.aufwand-<minimal|low|medium|high|xhigh>][.modell-<id>].md
 #   ART = BRIEF|WEISUNG|NACHFORDERUNG|GO|PING ; K = [A-Za-z0-9-]+
+#   Reihenfolge fest wie oben, .modell- immer zuletzt. Default exec = claude.
+#   exec-codex: "codex exec --json ..." (Thread-ID aus thread.started, Antwort aus
+#   item.completed/agent_message, Tokens aus turn.completed.usage).
+#   state/<K>.session = Session/Thread-ID, state/<K>.exec = Executor.
+#   aufwand: codex -> -c model_reasoning_effort=<x>; claude -> --effort (minimal wird low).
 #
 # Umgebung: FORGE_BASE (Default /srv/forge), FORGE_MAX_SECONDS (14400),
 #           FORGE_PERMISSION_MODE (bypassPermissions), FORGE_POLL (5),
-#           FORGE_MIN_AGE (3), CLAUDE_BIN (claude)
+#           FORGE_MIN_AGE (3), CLAUDE_BIN (claude), CODEX_BIN (codex)
 # Flags: --once  (eine Runde: alle faelligen Briefe abarbeiten, dann Ende)
 set -u
 
@@ -18,6 +23,7 @@ WORK="$BASE/work"
 POLL="${FORGE_POLL:-5}"
 MIN_AGE="${FORGE_MIN_AGE:-3}"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+CODEX_BIN="${CODEX_BIN:-codex}"
 ONCE=0
 [ "${1:-}" = "--once" ] && ONCE=1
 
@@ -68,6 +74,35 @@ PY
   fi
 }
 
+# codex_parse <jsonl> <thread|text|usage|error>
+#   thread: erste thread.started.thread_id; text: letzte agent_message (item.completed);
+#   usage: letztes turn.completed.usage; error: letzte turn.failed/error-Meldung.
+#   Nicht-JSON-Zeilen (Log-Ausgaben auf stdout) werden ignoriert.
+codex_parse() {
+  python3 -I - "$1" "$2" <<'PY' 2>/dev/null
+import json,sys
+thread=text=usage=err=None
+for line in open(sys.argv[1],errors="replace"):
+    line=line.strip()
+    if not line.startswith("{"): continue
+    try: e=json.loads(line)
+    except Exception: continue
+    if not isinstance(e,dict): continue
+    t=e.get("type")
+    if t=="thread.started" and thread is None: thread=e.get("thread_id")
+    elif t=="item.completed":
+        it=e.get("item") or {}
+        if it.get("type")=="agent_message" and it.get("text"): text=it["text"]
+    elif t=="turn.completed":
+        u=e.get("usage") or {}
+        usage="in=%s cached=%s out=%s reasoning=%s"%(u.get("input_tokens","-"),u.get("cached_input_tokens","-"),u.get("output_tokens","-"),u.get("reasoning_output_tokens","-"))
+    elif t=="turn.failed": err=(e.get("error") or {}).get("message") or "turn.failed"
+    elif t=="error" and not err: err=e.get("message")
+v={"thread":thread,"text":text,"usage":usage,"error":err}[sys.argv[2]]
+if v: print(v)
+PY
+}
+
 # write_report <ziel> <kopf-datei> <body-datei>   (atomar: .teil -> mv)
 write_report() {
   local dst="$1" head="$2" body="$3"
@@ -93,24 +128,34 @@ next_brief() {
 }
 
 process() {
-  local name="$1" base art k fort model sid="" start end t0 t1 dur rc=0
+  local name="$1" base art k fort model exec aufwand oldexec="" rejected=0 sid="" start end t0 t1 dur rc=0
   local ts run json err head body cost reportname
   base="${name%.md}"
   ts=$(utc)
   head=$(mktemp "$STATE/.head.XXXXXX"); body=$(mktemp "$STATE/.body.XXXXXX")
 
-  local re='^(BRIEF|WEISUNG|NACHFORDERUNG|GO|PING)_([A-Za-z0-9-]+)(\.fortsetzung)?(\.modell-([A-Za-z0-9._-]*[A-Za-z0-9]))?\.md$'
+  local re='^(BRIEF|WEISUNG|NACHFORDERUNG|GO|PING)_([A-Za-z0-9-]+)(\.fortsetzung)?(\.exec-(claude|codex))?(\.aufwand-(minimal|low|medium|high|xhigh))?(\.modell-([A-Za-z0-9._-]*[A-Za-z0-9]))?\.md$'
   reportname="REPORT_${base}_${ts}.md"
 
-  if ! [[ "$name" =~ $re ]] || [[ "${BASH_REMATCH[5]}" == *fortsetzung* ]]; then
+  local ok=0 m
+  if [[ "$name" =~ $re ]]; then
+    art="${BASH_REMATCH[1]}"; k="${BASH_REMATCH[2]}"
+    fort="${BASH_REMATCH[3]}"; exec="${BASH_REMATCH[5]:-claude}"
+    aufwand="${BASH_REMATCH[7]}"; model="${BASH_REMATCH[9]}"
+    ok=1
+    # Modell-IDs duerfen Punkte enthalten -> Marker anderer Segmente darin ablehnen (falsche Reihenfolge)
+    m=".$model"
+    [[ "$m" == *.fortsetzung* || "$m" == *.exec-* || "$m" == *.aufwand-* ]] && ok=0
+  fi
+  if [ "$ok" = 0 ]; then
     {
       echo "# REPORT $base"; echo
       echo "- Status: ABGELEHNT (Dateiname passt nicht zum Schema)"
       echo "- Brief: $name"; echo "- Zeit (UTC): $(utcl)"
     } > "$head"
     {
-      echo "Erwartet: \`<ART>_<K>[.fortsetzung][.modell-<id>].md\` mit ART in BRIEF|WEISUNG|NACHFORDERUNG|GO|PING und K = [A-Za-z0-9-]+."
-      echo "Reihenfolge: \`.fortsetzung\` vor \`.modell-\`. Der Brief wurde nicht ausgefuehrt."
+      echo "Erwartet: \`<ART>_<K>[.fortsetzung][.exec-<claude|codex>][.aufwand-<minimal|low|medium|high|xhigh>][.modell-<id>].md\` mit ART in BRIEF|WEISUNG|NACHFORDERUNG|GO|PING und K = [A-Za-z0-9-]+."
+      echo "Reihenfolge: \`.fortsetzung\`, \`.exec-\`, \`.aufwand-\`, \`.modell-\` (immer zuletzt). Der Brief wurde nicht ausgefuehrt."
     } > "$body"
     write_report "$AUS/$reportname" "$head" "$body"
     mv -f "$EIN/$name" "$ERL/${ts}_$name"
@@ -118,53 +163,85 @@ process() {
     rm -f "$head" "$body"
     return 0
   fi
-  art="${BASH_REMATCH[1]}"; k="${BASH_REMATCH[2]}"
-  fort="${BASH_REMATCH[3]}"; model="${BASH_REMATCH[5]}"
 
   run="${ts}_${base}"
   json="$LOGD/$run.json"; err="$LOGD/$run.stderr"
-  local -a args=(-p --output-format json --permission-mode "${FORGE_PERMISSION_MODE:-bypassPermissions}")
-  [ -n "$model" ] && args+=(--model "$model")
-
+  local -a args=()
   start=$(utcl); t0=$(date +%s)
   local skip=""
   if [ -n "$fort" ]; then
     if [ -s "$STATE/$k.session" ]; then
       sid=$(head -n1 "$STATE/$k.session" | tr -d '[:space:]')
-      args+=(--resume "$sid")
+      # Sessions ohne .exec-Datei stammen aus v1 -> claude
+      oldexec=$(head -n1 "$STATE/$k.exec" 2>/dev/null | tr -d '[:space:]'); oldexec="${oldexec:-claude}"
+      if [ "$oldexec" != "$exec" ]; then
+        rejected=1
+        skip="Fortsetzung mit Executor '$exec' abgelehnt: die gespeicherte Session fuer '$k' gehoert zu '$oldexec' (state/$k.exec). Neuen Brief ohne .fortsetzung senden oder passenden .exec- waehlen."
+      fi
     else
       skip="Fortsetzung angefordert, aber keine Session fuer Kuerzel '$k' in state/$k.session vorhanden."
     fi
   fi
 
-  local newsid="" result="" cost=""
+  local bin
+  if [ "$exec" = codex ]; then
+    bin="$CODEX_BIN"
+    if [ -n "$fort" ]; then args=(exec resume); else args=(exec); fi
+    args+=(--json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox)
+    [ -n "$model" ] && args+=(-m "$model")
+    [ -n "$aufwand" ] && args+=(-c "model_reasoning_effort=$aufwand")
+    [ -n "$fort" ] && args+=("$sid")
+    args+=(-)
+  else
+    bin="$CLAUDE_BIN"
+    args=(-p --output-format json --permission-mode "${FORGE_PERMISSION_MODE:-bypassPermissions}")
+    [ -n "$model" ] && args+=(--model "$model")
+    if [ -n "$aufwand" ]; then
+      [ "$aufwand" = minimal ] && args+=(--effort low) || args+=(--effort "$aufwand")
+    fi
+    [ -n "$fort" ] && [ -z "$skip" ] && args+=(--resume "$sid")
+  fi
+
+  local newsid="" result="" cost="" usage=""
   if [ -n "$skip" ]; then
-    rc=2
+    rc=2; [ "$rejected" = 1 ] && rc=REJECTED
     : > "$json"; printf '%s\n' "$skip" > "$err"
     printf '%s\n' "FEHLER: $skip" > "$body"
   else
-    ( cd "$WORK" && exec timeout "${FORGE_MAX_SECONDS:-14400}" "$CLAUDE_BIN" "${args[@]}" < "$EIN/$name" > "$json" 2> "$err" 9>&- ) &
+    ( cd "$WORK" && exec timeout "${FORGE_MAX_SECONDS:-14400}" "$bin" "${args[@]}" < "$EIN/$name" > "$json" 2> "$err" 9>&- ) &
     CHILD=$!
     wait "$CHILD"; rc=$?
     # wait kann durch Signal unterbrochen werden -> erneut auf Ende warten
     while kill -0 "$CHILD" 2>/dev/null; do wait "$CHILD"; rc=$?; done
     CHILD=""
     if [ -s "$json" ]; then
-      newsid=$(json_get "$json" session_id)
-      result=$(json_get "$json" result)
-      cost=$(json_get "$json" total_cost_usd)
-      [ -z "$cost" ] && cost=$(json_get "$json" cost_usd)
+      if [ "$exec" = codex ]; then
+        newsid=$(codex_parse "$json" thread)
+        result=$(codex_parse "$json" text)
+        usage=$(codex_parse "$json" usage)
+      else
+        newsid=$(json_get "$json" session_id)
+        result=$(json_get "$json" result)
+        cost=$(json_get "$json" total_cost_usd)
+        [ -z "$cost" ] && cost=$(json_get "$json" cost_usd)
+      fi
     fi
     if [ -n "$result" ]; then
       printf '%s\n' "$result" > "$body"
     else
       {
-        echo "FEHLER: keine auswertbare Antwort von claude (rc=$rc)."
+        echo "FEHLER: keine auswertbare Antwort von $exec (rc=$rc)."
+        if [ "$exec" = codex ]; then
+          cerr=$(codex_parse "$json" error); [ -n "$cerr" ] && { echo; echo "Meldung: $cerr"; }
+        fi
         echo; echo "stdout (Ende):"; echo '```'; tail -c 3000 "$json" 2>/dev/null; echo '```'
         echo; echo "stderr (Ende):"; echo '```'; tail -c 3000 "$err" 2>/dev/null; echo '```'
       } > "$body"
     fi
-    [ -n "$newsid" ] && printf '%s\n' "$newsid" > "$STATE/$k.session"
+    if [ -n "$newsid" ]; then
+      printf '%s\n' "$newsid" > "$STATE/$k.session"
+      printf '%s\n' "$exec" > "$STATE/$k.exec"
+    fi
   fi
   t1=$(date +%s); dur=$((t1 - t0)); end=$(utcl)
   [ "$rc" = 124 ] && echo "HINWEIS: Zeitlimit FORGE_MAX_SECONDS erreicht." >> "$body"
@@ -173,6 +250,9 @@ process() {
     echo "# REPORT $base"; echo
     echo "- Brief: $name"
     echo "- Art / Kuerzel: $art / $k"
+    echo "Executor: $exec"
+    [ "$rejected" = 1 ] && echo "- Status: ABGELEHNT (Executor passt nicht zur gespeicherten Session)"
+    [ -n "$aufwand" ] && echo "- Aufwand: $aufwand"
     echo "- Modell: ${model:-(Standard)}"
     if [ -n "$fort" ]; then echo "- Fortsetzung: ja (resume ${sid:-?})"; else echo "- Fortsetzung: nein"; fi
     echo "- Session: ${newsid:-${sid:--}}"
@@ -181,6 +261,7 @@ process() {
     echo "- Dauer: ${dur}s"
     echo "- Exit-Code: $rc"
     [ -n "$cost" ] && echo "- cost_usd: $cost"
+    [ -n "$usage" ] && echo "- usage (tokens): $usage"
     echo; echo "---"
   } > "$head"
   write_report "$AUS/$reportname" "$head" "$body"
