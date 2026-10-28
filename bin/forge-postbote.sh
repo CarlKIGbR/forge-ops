@@ -8,6 +8,7 @@
 #   Reihenfolge fest wie oben, .modell- immer zuletzt. Default exec = claude.
 #   exec-codex: "codex exec --json ..." (Thread-ID aus thread.started, Antwort aus
 #   item.completed/agent_message, Tokens aus turn.completed.usage).
+#   Report-Kopf enthaelt "- Run-ID: <ts>_<name>" (= erledigt/-Archivname); Archivierung erfolgt VOR dem Report.
 #   state/<K>.session = Session/Thread-ID, state/<K>.exec = Executor.
 #   aufwand: codex -> -c model_reasoning_effort=<x>; claude -> --effort (minimal wird low).
 #
@@ -151,14 +152,15 @@ process() {
     {
       echo "# REPORT $base"; echo
       echo "- Status: ABGELEHNT (Dateiname passt nicht zum Schema)"
-      echo "- Brief: $name"; echo "- Zeit (UTC): $(utcl)"
+      echo "- Brief: $name"; echo "- Run-ID: ${ts}_$name"; echo "- Zeit (UTC): $(utcl)"
     } > "$head"
     {
       echo "Erwartet: \`<ART>_<K>[.fortsetzung][.exec-<claude|codex>][.aufwand-<minimal|low|medium|high|xhigh>][.modell-<id>].md\` mit ART in BRIEF|WEISUNG|NACHFORDERUNG|GO|PING und K = [A-Za-z0-9-]+."
       echo "Reihenfolge: \`.fortsetzung\`, \`.exec-\`, \`.aufwand-\`, \`.modell-\` (immer zuletzt). Der Brief wurde nicht ausgefuehrt."
     } > "$body"
-    write_report "$AUS/$reportname" "$head" "$body"
+    # erst archivieren, dann Report veroeffentlichen (Importer sieht nie Report + Brief in eingang/)
     mv -f "$EIN/$name" "$ERL/${ts}_$name"
+    write_report "$AUS/$reportname" "$head" "$body"
     printf '%s %s %s rc=%s dauer=%ss session=%s\n' "$(utcl)" "$name" "-" "REJECTED" 0 "-" >> "$LOGD/postbote.log"
     rm -f "$head" "$body"
     return 0
@@ -249,6 +251,7 @@ process() {
   {
     echo "# REPORT $base"; echo
     echo "- Brief: $name"
+    echo "- Run-ID: ${ts}_$name"
     echo "- Art / Kuerzel: $art / $k"
     echo "Executor: $exec"
     [ "$rejected" = 1 ] && echo "- Status: ABGELEHNT (Executor passt nicht zur gespeicherten Session)"
@@ -264,8 +267,9 @@ process() {
     [ -n "$usage" ] && echo "- usage (tokens): $usage"
     echo; echo "---"
   } > "$head"
-  write_report "$AUS/$reportname" "$head" "$body"
+  # erst archivieren, dann Report veroeffentlichen (Run-ID = Archivname erledigt/<ts>_<name>)
   mv -f "$EIN/$name" "$ERL/${ts}_$name"
+  write_report "$AUS/$reportname" "$head" "$body"
   printf '%s %s %s rc=%s dauer=%ss session=%s\n' "$(utcl)" "$name" "${model:--}" "$rc" "$dur" "${newsid:-${sid:--}}" >> "$LOGD/postbote.log"
   rm -f "$head" "$body"
 }
