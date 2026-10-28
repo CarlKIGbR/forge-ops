@@ -3,9 +3,9 @@
 # Laeuft als User "forge". Nimmt Briefe aus eingang/, ruft "claude -p" auf,
 # schreibt Reports nach ausgang/. Strikt sequentiell (flock), Poll alle 5 s.
 #
-# Dateiname: <ART>_<K>[.fortsetzung][.exec-<claude|codex>][.aufwand-<minimal|low|medium|high|xhigh>][.modell-<id>].md
+# Dateiname: <ART>_<K>[.fortsetzung][.exec-<claude|codex>][.aufwand-<minimal|low|medium|high|xhigh>][.modell-<id>][.n-<8 hex>].md
 #   ART = BRIEF|WEISUNG|NACHFORDERUNG|GO|PING ; K = [A-Za-z0-9-]+
-#   Reihenfolge fest wie oben, .modell- immer zuletzt. Default exec = claude.
+#   Reihenfolge fest wie oben; .modell- steht vor dem optionalen Nonce .n-<8 hex> (Einwurf-Kennung, lowercase hex), der direkt vor .md steht. Default exec = claude.
 #   exec-codex: "codex exec --json ..." (Thread-ID aus thread.started, Antwort aus
 #   item.completed/agent_message, Tokens aus turn.completed.usage).
 #   Report-Kopf enthaelt "- Run-ID: <ts>_<name>" (= erledigt/-Archivname); Archivierung erfolgt VOR dem Report.
@@ -129,21 +129,26 @@ next_brief() {
 }
 
 process() {
-  local name="$1" base art k fort model exec aufwand oldexec="" rejected=0 sid="" start end t0 t1 dur rc=0
+  local name="$1" base art k fort model nonce="" exec aufwand oldexec="" rejected=0 sid="" start end t0 t1 dur rc=0
   local ts run json err head body cost reportname
   base="${name%.md}"
   ts=$(utc)
   head=$(mktemp "$STATE/.head.XXXXXX"); body=$(mktemp "$STATE/.body.XXXXXX")
 
-  local re='^(BRIEF|WEISUNG|NACHFORDERUNG|GO|PING)_([A-Za-z0-9-]+)(\.fortsetzung)?(\.exec-(claude|codex))?(\.aufwand-(minimal|low|medium|high|xhigh))?(\.modell-([A-Za-z0-9._-]*[A-Za-z0-9]))?\.md$'
+  local re='^(BRIEF|WEISUNG|NACHFORDERUNG|GO|PING)_([A-Za-z0-9-]+)(\.fortsetzung)?(\.exec-(claude|codex))?(\.aufwand-(minimal|low|medium|high|xhigh))?(\.modell-([A-Za-z0-9._-]*[A-Za-z0-9]))?(\.n-([0-9a-f]{8}))?\.md$'
   reportname="REPORT_${base}_${ts}.md"
 
   local ok=0 m
   if [[ "$name" =~ $re ]]; then
     art="${BASH_REMATCH[1]}"; k="${BASH_REMATCH[2]}"
     fort="${BASH_REMATCH[3]}"; exec="${BASH_REMATCH[5]:-claude}"
-    aufwand="${BASH_REMATCH[7]}"; model="${BASH_REMATCH[9]}"
+    aufwand="${BASH_REMATCH[7]}"; model="${BASH_REMATCH[9]}"; nonce="${BASH_REMATCH[11]}"
+    # Greedy-Modell schluckt ein folgendes ".n-<hex>" -> abspalten
+    if [[ "$model" =~ ^(.*[A-Za-z0-9])\.n-([0-9a-f]{8})$ ]]; then
+      model="${BASH_REMATCH[1]}"; nonce="${BASH_REMATCH[2]}"
+    fi
     ok=1
+    [[ "$model" =~ ^\.n-[0-9a-f]{8}$ ]] && ok=0   # ".modell-" ohne echte Modell-ID
     # Modell-IDs duerfen Punkte enthalten -> Marker anderer Segmente darin ablehnen (falsche Reihenfolge)
     m=".$model"
     [[ "$m" == *.fortsetzung* || "$m" == *.exec-* || "$m" == *.aufwand-* ]] && ok=0
@@ -155,7 +160,7 @@ process() {
       echo "- Brief: $name"; echo "- Run-ID: ${ts}_$name"; echo "- Zeit (UTC): $(utcl)"
     } > "$head"
     {
-      echo "Erwartet: \`<ART>_<K>[.fortsetzung][.exec-<claude|codex>][.aufwand-<minimal|low|medium|high|xhigh>][.modell-<id>].md\` mit ART in BRIEF|WEISUNG|NACHFORDERUNG|GO|PING und K = [A-Za-z0-9-]+."
+      echo "Erwartet: \`<ART>_<K>[.fortsetzung][.exec-<claude|codex>][.aufwand-<minimal|low|medium|high|xhigh>][.modell-<id>][.n-<8 hex>].md\` mit ART in BRIEF|WEISUNG|NACHFORDERUNG|GO|PING und K = [A-Za-z0-9-]+."
       echo "Reihenfolge: \`.fortsetzung\`, \`.exec-\`, \`.aufwand-\`, \`.modell-\` (immer zuletzt). Der Brief wurde nicht ausgefuehrt."
     } > "$body"
     # erst archivieren, dann Report veroeffentlichen (Importer sieht nie Report + Brief in eingang/)
@@ -252,6 +257,7 @@ process() {
     echo "# REPORT $base"; echo
     echo "- Brief: $name"
     echo "- Run-ID: ${ts}_$name"
+    [ -n "$nonce" ] && echo "- Nonce: $nonce"
     echo "- Art / Kuerzel: $art / $k"
     echo "Executor: $exec"
     [ "$rejected" = 1 ] && echo "- Status: ABGELEHNT (Executor passt nicht zur gespeicherten Session)"

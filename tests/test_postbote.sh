@@ -100,5 +100,21 @@ check "v1-Session ohne .exec -> claude-Fortsetzung ok" grep -q -- '--resume clau
 run BRIEF_T9.fortsetzung.exec-codex.md
 check "fortsetzung ohne Session: Fehlerreport, kein Aufruf" bash -c "test -z \"\$1\" && grep -q 'keine Session' '$R'" _ "$L"
 
+# 9 Nonce: .n-<8 hex> direkt vor .md (nach .modell-)
+run BRIEF_T5.exec-claude.aufwand-low.modell-claude-haiku-4-5.n-0a1b2c3d.md
+check "nonce+modell: Modell ohne Nonce an CLI" bash -c "grep -q -- '--model claude-haiku-4-5 ' <<<\"\$1 \" && ! grep ARGV <<<\"\$1\" | grep -q 'n-0a1b2c3d'" _ "$L"
+check "nonce: Header Nonce + Run-ID + Brief" bash -c "grep -q '^- Nonce: 0a1b2c3d' '$R' && grep -Eq '^- Run-ID: [0-9]{8}T[0-9]{6}Z_BRIEF_T5.*\\.n-0a1b2c3d\\.md\$' '$R' && grep -q '^- Modell: claude-haiku-4-5\$' '$R'"
+check "nonce: Archivname behaelt Nonce" bash -c "ls $FORGE_BASE/post/erledigt | grep -q 'BRIEF_T5.*modell-claude-haiku-4-5.n-0a1b2c3d.md\$'"
+run BRIEF_T6.n-deadbeef.md
+check "nonce ohne modell: akzeptiert" bash -c "grep -q '^- Nonce: deadbeef' '$R' && grep -q 'Exit-Code: 0' '$R' && grep -q 'Modell: (Standard)' '$R'"
+run BRIEF_T7.exec-codex.modell-gpt-6-luna.n-0123abcd.md
+check "nonce codex: -m ohne Nonce" bash -c "grep -q -- '-m gpt-6-luna ' <<<\"\$1 \" && ! grep ARGV <<<\"\$1\" | grep -q 'n-0123abcd'" _ "$L"
+for n in BRIEF_T8.n-XYZ12345.md BRIEF_T8.n-abc.md BRIEF_T8.n-0a1b2c3d.exec-codex.md BRIEF_T8.modell-.n-0a1b2c3d.md; do
+  run "$n"
+  check "nonce falsch/Reihenfolge abgelehnt: $n" bash -c "test -z \"\$1\" && grep -q 'ABGELEHNT (Dateiname' '$R'" _ "$L"
+done
+run BRIEF_T9.md
+check "ohne nonce: kein Nonce-Header" bash -c "! grep -q '^- Nonce' '$R'"
+
 echo "---- $PASS bestanden, $FAIL fehlgeschlagen"
 [ "$FAIL" = 0 ]
