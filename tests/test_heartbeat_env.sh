@@ -60,6 +60,10 @@ echo hi > "$FORGE_BASE/post/eingang/BRIEF_forge-t9b.md"
 t0=$(date +%s); FORGE_HB_INTERVAL=30 bash "$WATCHER" --once 2>&1 | cat >/dev/null; el=$(( $(date +%s) - t0 ))
 [ "$el" -lt 15 ] && ok "Watcher-Lauf haelt keine Pipe offen (${el}s)" || bad "Pipe offen: ${el}s"
 
+# R7: Standard-Intervall strikt unter 60 s (Scheduling-Overhead)
+def=$(sed -n 's/.*FORGE_HB_INTERVAL:-\([0-9]*\)}.*/\1/p' "$WATCHER" | head -n1)
+[ -n "$def" ] && [ "$def" -le 50 ] && ok "Heartbeat-Standardintervall ${def}s < 60s" || bad "Heartbeat-Standard ${def:-?}"
+
 # Trockenlauf: nur Namen + maskierte Werte
 out=$(bash -c '. "$1"; forge_exec_env_dryrun claude 2026T_BRIEF_x.md forge forge-x' _ "$HERE/../bin/forge-exec-env.sh")
 grep -q 'OTEL_EXPORTER_OTLP_HEADERS=<unset>' <<<"$out" && grep -q 'FORGE_MCP_TOKEN=<masked:' <<<"$out" && ! grep -q "$exp\|sk-lf-test\|mcp-token\|leaked" <<<"$out" && ok "dryrun: maskiert, keine OTEL-Auth" || bad "dryrun: $out"
