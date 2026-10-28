@@ -20,7 +20,7 @@ cat > "$CLAUDE_BIN" <<'S'
 cat >/dev/null
 for i in 1 2 3 4; do sleep 1; cat "$HBFILE" >> "$STUB_LOG.hb" 2>/dev/null; done
 { echo "CLAUDE_TEL=${CLAUDE_CODE_ENABLE_TELEMETRY:-}"; echo "ENH=${CLAUDE_CODE_ENHANCED_TELEMETRY_BETA:-}"; echo "EXP=${OTEL_TRACES_EXPORTER:-}"; echo "PROTO=${OTEL_EXPORTER_OTLP_PROTOCOL:-}"
-  echo "EP=${OTEL_EXPORTER_OTLP_ENDPOINT:-}"; echo "RA=${OTEL_RESOURCE_ATTRIBUTES:-}"; echo "HDR=${OTEL_EXPORTER_OTLP_HEADERS:-}"; echo "MCP=${FORGE_MCP_TOKEN:-}"; echo "ARGV=$*"; } > "$STUB_LOG.claude"
+  echo "EP=${OTEL_EXPORTER_OTLP_ENDPOINT:-}"; echo "RA=${OTEL_RESOURCE_ATTRIBUTES:-}"; echo "HDR=${OTEL_EXPORTER_OTLP_HEADERS:-}"; echo "MCP=${FORGE_MCP_TOKEN:-}"; echo "PROJ=${FORGE_PROJECT:-}"; echo "ARGV=$*"; } > "$STUB_LOG.claude"
 printf '{"type":"result","subtype":"success","session_id":"sid-1","result":"PONG","total_cost_usd":0.01}\n'
 S
 cat > "$CODEX_BIN" <<'S'
@@ -45,6 +45,7 @@ exp=$(printf 'pk-lf-test:sk-lf-test' | base64 -w0)
 [ -z "$(get HDR)" ] && ok "claude: kein OTLP-Auth-Header (auch nicht aus dem Elternprozess)" || bad "Header gesetzt"
 ra=$(get RA)
 [[ "$ra" =~ ^forge\.run_id=[0-9]{8}T[0-9]{6}Z_BRIEF_forge-t9\.md,forge\.project=forge,forge\.kuerzel=forge-t9$ ]] && ok "OTEL_RESOURCE_ATTRIBUTES run_id/project/kuerzel" || bad "RA=$ra"
+[ "$(get PROJ)" = forge ] && ok "FORGE_PROJECT = Projekt des Briefs" || bad "FORGE_PROJECT $(get PROJ)"
 [ "$(get MCP)" = mcp-token-AAAA ] && ok "claude: FORGE_MCP_TOKEN aus Datei" || bad "MCP-Token"
 grep -q 'mcp-token-AAAA\|sk-lf-test\|'"$exp" <<<"$(get ARGV)" && bad "Geheimnis in argv" || ok "kein Geheimnis in argv"
 grep -rq 'mcp-token-AAAA\|sk-lf-test\|'"$exp" "$FORGE_BASE/post/log" "$FORGE_BASE/post/ausgang" 2>/dev/null && bad "Geheimnis in Log/Report" || ok "kein Geheimnis in Log/Report"

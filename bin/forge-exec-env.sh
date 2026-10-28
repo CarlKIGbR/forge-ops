@@ -13,6 +13,7 @@ forge_exec_env() {
   [ -n "$tok" ] && export FORGE_MCP_TOKEN="$tok"
   unset OTEL_EXPORTER_OTLP_HEADERS FORGE_OTEL_AUTH
   [ -n "$run_id" ] && export FORGE_RUN_ID="$run_id"
+  [ -n "$project" ] && export FORGE_PROJECT="$project"        # mem_search-Standardprojekt (Header X-Forge-Project)
   export OTEL_RESOURCE_ATTRIBUTES="forge.run_id=${run_id},forge.project=${project},forge.kuerzel=${kuerzel}"
   export OTEL_EXPORTER_OTLP_PROTOCOL="http/protobuf"
   if [ "$ex" = codex ]; then
@@ -28,7 +29,7 @@ forge_exec_env() {
 forge_exec_env_dryrun() {
   local ex="${1:-claude}" v val
   ( forge_exec_env "$ex" "${2:-20261028T000000Z_BRIEF_x.md}" "${3:-forge}" "${4:-forge-x}"
-    for v in FORGE_MCP_TOKEN FORGE_RUN_ID CLAUDE_CODE_ENABLE_TELEMETRY CLAUDE_CODE_ENHANCED_TELEMETRY_BETA OTEL_TRACES_EXPORTER OTEL_EXPORTER_OTLP_PROTOCOL \
+    for v in FORGE_MCP_TOKEN FORGE_RUN_ID FORGE_PROJECT CLAUDE_CODE_ENABLE_TELEMETRY CLAUDE_CODE_ENHANCED_TELEMETRY_BETA OTEL_TRACES_EXPORTER OTEL_EXPORTER_OTLP_PROTOCOL \
              OTEL_EXPORTER_OTLP_ENDPOINT OTEL_RESOURCE_ATTRIBUTES OTEL_EXPORTER_OTLP_HEADERS FORGE_OTEL_AUTH; do
       val="${!v-}"
       if [ -z "$val" ]; then echo "$v=<unset>"
