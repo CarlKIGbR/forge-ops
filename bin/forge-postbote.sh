@@ -118,11 +118,11 @@ heartbeat() {
   utcl > "$STATE/.heartbeat.tmp" && mv -f "$STATE/.heartbeat.tmp" "$STATE/heartbeat"
 }
 
-# Solange ein Auftrag laeuft, alle FORGE_HB_INTERVAL s (50, bewusst < 60) einen Heartbeat schreiben (sonst "stale" bei langen Runs)
+# Solange ein Auftrag laeuft, alle FORGE_HB_INTERVAL s (45; Abstand inkl. Overhead <= 50) einen Heartbeat schreiben (sonst "stale" bei langen Runs)
 HBPID=""
 hb_start() {
   # stdout/stderr/Lock-FD schliessen: ein verwaister sleep darf weder Pipes des Aufrufers noch den flock halten
-  ( while kill -0 "$$" 2>/dev/null; do sleep "${FORGE_HB_INTERVAL:-50}" >/dev/null 2>&1 9>&- & wait $!; kill -0 "$$" 2>/dev/null && heartbeat; done ) >/dev/null 2>&1 9>&- &
+  ( while kill -0 "$$" 2>/dev/null; do sleep "${FORGE_HB_INTERVAL:-45}" >/dev/null 2>&1 9>&- & wait $!; kill -0 "$$" 2>/dev/null && heartbeat; done ) >/dev/null 2>&1 9>&- &
   HBPID=$!
 }
 hb_stop() {

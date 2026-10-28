@@ -63,7 +63,7 @@ t0=$(date +%s); FORGE_HB_INTERVAL=30 bash "$WATCHER" --once 2>&1 | cat >/dev/nul
 
 # R7: Standard-Intervall strikt unter 60 s (Scheduling-Overhead)
 def=$(sed -n 's/.*FORGE_HB_INTERVAL:-\([0-9]*\)}.*/\1/p' "$WATCHER" | head -n1)
-[ -n "$def" ] && [ "$def" -le 50 ] && ok "Heartbeat-Standardintervall ${def}s < 60s" || bad "Heartbeat-Standard ${def:-?}"
+[ -n "$def" ] && [ "$def" -le 45 ] && ok "Heartbeat-Standardintervall ${def}s (Abstand <= 50s inkl. Overhead)" || bad "Heartbeat-Standard ${def:-?}"
 
 # Trockenlauf: nur Namen + maskierte Werte
 out=$(bash -c '. "$1"; forge_exec_env_dryrun claude 2026T_BRIEF_x.md forge forge-x' _ "$HERE/../bin/forge-exec-env.sh")
