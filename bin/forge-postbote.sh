@@ -15,6 +15,7 @@
 # Umgebung: FORGE_BASE (Default /srv/forge), FORGE_MAX_SECONDS (14400),
 #           FORGE_PERMISSION_MODE (bypassPermissions), FORGE_POLL (5),
 #           FORGE_MIN_AGE (3), CLAUDE_BIN (claude), CODEX_BIN (codex)
+# Neustart: bin/forge-request-restart.sh "<grund>" (Flag state/restart-requested, wirkt nur zwischen Runs). SIGTERM waehrend eines Runs wird bis zu dessen Ende aufgeschoben.
 # Flags: --once  (eine Runde: alle faelligen Briefe abarbeiten, dann Ende)
 set -u
 
@@ -34,6 +35,7 @@ ONCE=0
 umask 0002
 export PATH="${HOME:-/srv/forge/home}/.local/bin:$PATH"
 
+RESTART_FLAG="$POST/state/restart-requested"
 EIN="$POST/eingang"; AUS="$POST/ausgang"; ERL="$POST/erledigt"
 LOGD="$POST/log"; STATE="$POST/state"
 mkdir -p "$EIN" "$AUS" "$ERL" "$LOGD" "$STATE" "$WORK" || { echo "FEHLER: Verzeichnisse nicht anlegbar unter $BASE" >&2; exit 1; }
@@ -46,13 +48,17 @@ if ! flock -n 9; then
 fi
 
 STOP=0
+TERMS=0
 CHILD=""
+# Erstes SIGTERM/SIGINT: nichts Neues beginnen, laufenden Auftrag zu Ende fuehren (Report/Archiv/Log), danach Ende.
+# Zweites Signal: laufenden Auftrag beenden (SIGTERM an den Kindprozess). Der Unit-Stop-Timeout (SIGKILL) bleibt als letzte Instanz.
 # shellcheck disable=SC2329
 on_term() {
-  STOP=1
-  # laufenden Auftrag sauber beenden, nichts Neues beginnen
-  [ -n "$CHILD" ] && kill -TERM "$CHILD" 2>/dev/null
-  hb_stop
+  STOP=1; TERMS=$((TERMS + 1))
+  if [ "$TERMS" -ge 2 ]; then
+    [ -n "$CHILD" ] && kill -TERM "$CHILD" 2>/dev/null
+    hb_stop
+  fi
 }
 trap on_term TERM INT
 
@@ -301,6 +307,13 @@ process() {
 while :; do
   heartbeat
   [ "$STOP" = 1 ] && break
+  # Neustart-Anforderung (bin/forge-request-restart.sh): nur hier, zwischen Runs, vor dem Claimen des naechsten Briefs
+  if [ -e "$RESTART_FLAG" ]; then
+    rid=$(sed -n 's/^requester=//p' "$RESTART_FLAG" 2>/dev/null | head -n1); rid="${rid:-unknown}"
+    rm -f "$RESTART_FLAG"
+    printf '%s RESTART requested by %s\n' "$(utcl)" "$rid" >> "$LOGD/postbote.log"
+    exit 0   # systemd (Restart=always) startet neu
+  fi
   if name=$(next_brief); then
     process "$name"
     [ "$STOP" = 1 ] && break
