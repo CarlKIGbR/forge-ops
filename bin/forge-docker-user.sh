@@ -67,17 +67,35 @@ stop_timers() {
     systemctl stop "$UNIT_PREFIX-*.timer" 2>/dev/null || true
 }
 
+# Rueckgabe 0 = alle $TAG-Regeln entfernt/nicht vorhanden; 1 = Loeschen scheiterte; 2 = Pruefung (-C) selbst scheiterte.
+# iptables -C: Exit 0 = Regel da, Exit 1 = Regel fehlt; jeder andere Exit (z. B. 2, Fehler/Lock/Syntax) ist KEINE Abwesenheit.
 remove_rules() {
-    local s rc=0
+    local s rc
     for s in "${specs[@]}"; do
         if [ "$dry" = 1 ]; then
             echo "$IPT -D $CHAIN $s"
-        else
-            # shellcheck disable=SC2086  # s ist bewusst wortgetrennt
-            while $IPT -C "$CHAIN" $s 2>/dev/null; do $IPT -D "$CHAIN" $s || { rc=1; break; }; done
+            continue
         fi
+        while :; do
+            # shellcheck disable=SC2086  # s ist bewusst wortgetrennt
+            if $IPT -C "$CHAIN" $s 2>/dev/null; then rc=0; else rc=$?; fi
+            case "$rc" in
+                0) # shellcheck disable=SC2086
+                   $IPT -D "$CHAIN" $s || return 1 ;;
+                1) break ;;
+                *) return 2 ;;
+            esac
+        done
     done
-    return "$rc"
+    return 0
+}
+
+# Cleanup verifizieren: Chain auflisten (muss gelingen) und keine eigene Regel mehr finden.
+rules_gone() {
+    local out
+    out="$($IPT -S "$CHAIN" 2>/dev/null)" || return 1
+    case "$out" in *"--comment $TAG"*) return 1 ;; esac
+    return 0
 }
 
 insert_rules() {
@@ -133,12 +151,20 @@ case "$mode" in
         ARMED_UNIT=""
         arm_timer || { echo "Rollback-Timer konnte nicht scharfgeschaltet werden - keine Regel geaendert" >&2; exit 1; }
         stop_old_timers
-        if remove_rules && insert_rules; then
+        if ! remove_rules; then
+            echo "Pruefung/Entfernen vorhandener Regeln scheiterte - Abbruch, Rollback-Timer bleibt scharf" >&2
+            exit 1
+        fi
+        if insert_rules; then
             echo "Regeln aktiv. Rollback in ${ROLLBACK_SECONDS} s, ausser: sudo $SELF --confirm"
         else
             echo "Fehler beim Setzen der Regeln - Rollback sofort" >&2
             remove_rules || true
-            systemctl stop "$ARMED_UNIT" 2>/dev/null || true
+            if rules_gone; then
+                systemctl stop "$ARMED_UNIT" 2>/dev/null || true
+            else
+                echo "Cleanup nicht verifiziert - Rollback-Timer bleibt scharf ($ARMED_UNIT), Regeln pruefen!" >&2
+            fi
             exit 1
         fi
         ;;
