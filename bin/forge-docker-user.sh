@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 # forge-docker-user.sh - DOCKER-USER-Regeln fuer den Forge-Edge (Caddy auf 192.168.10.4:443/8443).
 #
-#   sudo forge-docker-user.sh             Regeln setzen (idempotent) + Rollback-Timer 300 s
-#   sudo forge-docker-user.sh --confirm   Timer stoppen, Regeln bleiben
-#   sudo forge-docker-user.sh --remove    Regeln entfernen (und Timer stoppen)
-#   forge-docker-user.sh --dry-run [--remove]   nur die Kommandos ausgeben, nichts aendern
+#   sudo forge-docker-user.sh               Rollback-Timer (300 s) scharfschalten + pruefen, DANN Regeln setzen (idempotent)
+#   sudo forge-docker-user.sh --confirm     Timer stoppen, Regeln bleiben; merkt sich "bestaetigt" fuer den Boot
+#   sudo forge-docker-user.sh --remove      Regeln entfernen, Timer stoppen, "bestaetigt" loeschen
+#   sudo forge-docker-user.sh --install-unit   Script nach /usr/local/sbin, systemd-Units installieren + enable (kein Start)
+#   sudo forge-docker-user.sh --restore     (von der Unit beim Boot) bestaetigte Regeln ohne Timer wiederherstellen;
+#                                           ohne "bestaetigt" Exit 1 -> forge-edge.service startet nicht
+#   forge-docker-user.sh --dry-run [--remove|--install-unit|--confirm]   nur die Kommandos ausgeben, nichts aendern
 #
 # Erlaubt 10.200.0.0/29, 192.168.10.0/29, 192.168.30.0/29 auf 192.168.10.4:443 und :8443, alles andere
 # auf diese Ziele wird verworfen. Andere Ports, ufw und andere Chains bleiben unberuehrt.
 # Docker DNATet vor DOCKER-USER, daher wird das Original-Ziel per conntrack (--ctorigdst/--ctorigdstport,
 # nur Richtung ORIGINAL, damit Antwortpakete nicht getroffen werden) abgeglichen.
+# Sicherheit: Der Rollback-Timer wird VOR der ersten Regel-Aenderung angelegt und geprueft; scheitert das, aendert
+# das Script nichts (Exit 1). Scheitert danach eine Regel-Aenderung, werden die Regeln sofort zurueckgenommen.
 set -euo pipefail
 
 EDGE_IP="${EDGE_IP:-192.168.10.4}"
@@ -17,10 +22,16 @@ NETS=(10.200.0.0/29 192.168.10.0/29 192.168.30.0/29)
 PORTS=(443 8443)
 CHAIN=DOCKER-USER
 TAG=forge-edge
-UNIT=forge-docker-user-rollback
+UNIT_PREFIX=forge-docker-user-rollback
 ROLLBACK_SECONDS=300
 IPT="${IPTABLES:-iptables}"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+STATE_DIR="${FORGE_FW_STATE_DIR:-/var/lib/forge-edge}"
+CONFIRMED="$STATE_DIR/rules-confirmed"
+UNIT_SRC="${FORGE_EDGE_UNIT_SRC:-/srv/forge/work/forge-edge/systemd}"
+UNIT_DST="${FORGE_FW_UNIT_DST:-/etc/systemd/system}"
+SBIN_COPY="${FORGE_FW_SBIN:-/usr/local/sbin}/forge-docker-user.sh"
+UNITS=(forge-docker-user.service forge-edge.service)
 
 mode=apply
 dry=0
@@ -28,8 +39,10 @@ for a in "$@"; do
     case "$a" in
         --confirm) mode=confirm ;;
         --remove) mode=remove ;;
+        --restore) mode=restore ;;
+        --install-unit) mode=install ;;
         --dry-run) dry=1 ;;
-        -h|--help) sed -n '2,12p' "$SELF"; exit 0 ;;
+        -h|--help) sed -n '2,19p' "$SELF"; exit 0 ;;
         *) echo "unbekannte Option: $a" >&2; exit 2 ;;
     esac
 done
@@ -49,70 +62,138 @@ run() {
     if [ "$dry" = 1 ]; then echo "$*"; else "$@"; fi
 }
 
-timer_cmd() {
-    echo "systemd-run --unit=$UNIT --on-active=${ROLLBACK_SECONDS}s $SELF --remove"
-}
-
-stop_timer() {
-    if [ "$dry" = 1 ]; then echo "systemctl stop $UNIT.timer"; return 0; fi
-    systemctl stop "$UNIT.timer" 2>/dev/null || true
+stop_timers() {
+    if [ "$dry" = 1 ]; then echo "systemctl stop '$UNIT_PREFIX-*.timer'"; return 0; fi
+    systemctl stop "$UNIT_PREFIX-*.timer" 2>/dev/null || true
 }
 
 remove_rules() {
-    local s
+    local s rc=0
     for s in "${specs[@]}"; do
         if [ "$dry" = 1 ]; then
             echo "$IPT -D $CHAIN $s"
         else
             # shellcheck disable=SC2086  # s ist bewusst wortgetrennt
-            while $IPT -C "$CHAIN" $s 2>/dev/null; do $IPT -D "$CHAIN" $s; done
+            while $IPT -C "$CHAIN" $s 2>/dev/null; do $IPT -D "$CHAIN" $s || { rc=1; break; }; done
         fi
+    done
+    return "$rc"
+}
+
+insert_rules() {
+    local i=1 s
+    for s in "${specs[@]}"; do
+        # shellcheck disable=SC2086
+        run $IPT -I "$CHAIN" "$i" $s || return 1
+        i=$((i + 1))
     done
 }
 
 need_root() {
-    if [ "$dry" = 0 ] && [ "$(id -u)" -ne 0 ]; then
-        echo "als root ausfuehren (sudo $0 ${*})" >&2
+    if [ "$dry" = 0 ] && [ "$(id -u)" -ne 0 ] && [ "${FORGE_FW_TEST:-0}" != 1 ]; then
+        echo "als root ausfuehren (sudo $SELF $*)" >&2
         exit 1
     fi
+}
+
+check_env() {
+    $IPT -n -L "$CHAIN" >/dev/null 2>&1 || { echo "Chain $CHAIN fehlt (laeuft Docker?)" >&2; exit 1; }
+}
+
+# Timer scharfschalten UND pruefen; Rueckgabe 0 = aktiv. Eindeutiger Unit-Name, damit ein alter Timer
+# bis zum Erfolg weiterlaeuft (kein ungeschuetztes Fenster).
+arm_timer() {
+    local unit
+    unit="$UNIT_PREFIX-$(date +%s)-$$"
+    systemd-run --unit="$unit" --on-active="${ROLLBACK_SECONDS}s" "$SELF" --remove >/dev/null || return 1
+    [ "$(systemctl is-active "$unit.timer" 2>/dev/null)" = active ] || { systemctl stop "$unit.timer" 2>/dev/null || true; return 1; }
+    ARMED_UNIT="$unit.timer"
+}
+
+stop_old_timers() {
+    local t
+    while read -r t _; do
+        [ -n "$t" ] && [ "$t" != "$ARMED_UNIT" ] && systemctl stop "$t" 2>/dev/null || true
+    done < <(systemctl list-units --plain --no-legend "$UNIT_PREFIX-*.timer" 2>/dev/null || true)
 }
 
 case "$mode" in
     apply)
         need_root "$@"
-        if [ "$dry" = 0 ]; then
-            $IPT -n -L "$CHAIN" >/dev/null 2>&1 || { echo "Chain $CHAIN fehlt (laeuft Docker?)" >&2; exit 1; }
-            command -v systemd-run >/dev/null || { echo "systemd-run fehlt - ohne Rollback-Timer keine Regeln" >&2; exit 1; }
-            stop_timer
-        else
-            echo "# 1. vorhandene $TAG-Regeln werden zuerst entfernt (idempotent, iptables -C/-D je Regel)"
-            echo "# 2. Regeln einfuegen (Allow je Netz und Port, danach Drop):"
-        fi
-        [ "$dry" = 1 ] || remove_rules
-        i=1
-        for s in "${specs[@]}"; do
-            # shellcheck disable=SC2086
-            run $IPT -I "$CHAIN" "$i" $s
-            i=$((i + 1))
-        done
-        [ "$dry" = 1 ] && echo "# 3. Rollback-Timer (${ROLLBACK_SECONDS} s):"
         if [ "$dry" = 1 ]; then
-            timer_cmd
-        else
-            systemd-run --unit="$UNIT" --on-active="${ROLLBACK_SECONDS}s" "$SELF" --remove >/dev/null
+            echo "# 1. Rollback-Timer (${ROLLBACK_SECONDS} s) anlegen und pruefen - vor jeder Regel-Aenderung; sonst Abbruch ohne Aenderung:"
+            echo "systemd-run --unit=$UNIT_PREFIX-<zeit>-<pid> --on-active=${ROLLBACK_SECONDS}s $SELF --remove"
+            echo "# 2. vorhandene $TAG-Regeln werden zuerst entfernt (idempotent, iptables -C/-D je Regel)"
+            echo "# 3. Regeln einfuegen (Allow je Netz und Port, danach Drop); bei einem Fehler sofort alle $TAG-Regeln entfernen:"
+            insert_rules
+            exit 0
+        fi
+        check_env
+        command -v systemd-run >/dev/null || { echo "systemd-run fehlt - ohne Rollback-Timer keine Regeln" >&2; exit 1; }
+        ARMED_UNIT=""
+        arm_timer || { echo "Rollback-Timer konnte nicht scharfgeschaltet werden - keine Regel geaendert" >&2; exit 1; }
+        stop_old_timers
+        if remove_rules && insert_rules; then
             echo "Regeln aktiv. Rollback in ${ROLLBACK_SECONDS} s, ausser: sudo $SELF --confirm"
+        else
+            echo "Fehler beim Setzen der Regeln - Rollback sofort" >&2
+            remove_rules || true
+            systemctl stop "$ARMED_UNIT" 2>/dev/null || true
+            exit 1
         fi
         ;;
     confirm)
         need_root "$@"
-        stop_timer
-        [ "$dry" = 1 ] || echo "bestaetigt: Rollback-Timer gestoppt, Regeln bleiben (bis Reboot)"
+        if [ "$dry" = 1 ]; then
+            echo "systemctl stop '$UNIT_PREFIX-*.timer'"
+            echo "mkdir -p $STATE_DIR && touch $CONFIRMED"
+            exit 0
+        fi
+        # nur bestaetigen, wenn die Regeln wirklich da sind
+        [ -n "$($IPT -S "$CHAIN" 2>/dev/null | grep -- "--comment $TAG" || true)" ] || { echo "keine $TAG-Regeln aktiv - nichts zu bestaetigen" >&2; exit 1; }
+        stop_timers
+        mkdir -p "$STATE_DIR"
+        touch "$CONFIRMED"
+        echo "bestaetigt: Rollback-Timer gestoppt, Regeln bleiben und werden beim Boot wiederhergestellt"
         ;;
     remove)
         need_root "$@"
-        [ "$dry" = 1 ] && echo "# Regeln entfernen:"
+        if [ "$dry" = 1 ]; then
+            echo "# Regeln entfernen:"
+            remove_rules
+            stop_timers
+            echo "rm -f $CONFIRMED"
+            exit 0
+        fi
+        rm -f "$CONFIRMED"
         remove_rules
-        stop_timer
-        [ "$dry" = 1 ] || echo "Regeln entfernt"
+        stop_timers
+        echo "Regeln entfernt"
+        ;;
+    restore)
+        need_root "$@"
+        if [ "$dry" = 1 ]; then
+            echo "# nur wenn $CONFIRMED existiert:"
+            remove_rules
+            insert_rules
+            exit 0
+        fi
+        [ -e "$CONFIRMED" ] || { echo "Regeln nie bestaetigt ($CONFIRMED fehlt) - Edge bleibt gesperrt" >&2; exit 1; }
+        check_env
+        if remove_rules && insert_rules; then
+            echo "bestaetigte Regeln wiederhergestellt"
+        else
+            remove_rules || true
+            exit 1
+        fi
+        ;;
+    install)
+        need_root "$@"
+        run install -m 0755 "$SELF" "$SBIN_COPY"
+        for u in "${UNITS[@]}"; do
+            run install -m 0644 "$UNIT_SRC/$u" "$UNIT_DST/$u"
+        done
+        run systemctl daemon-reload
+        run systemctl enable "${UNITS[@]}"
         ;;
 esac
