@@ -62,5 +62,71 @@ wait $H3 2>/dev/null
 check "forge-release idempotent"                                bash "$FREL"
 check "forge-stop legt fehlendes control/ an"                   bash -c "rm -rf '$CTRL'; bash '$FSTOP' >/dev/null && test -f '$CTRL/STOP'"
 
+
+# --- Rework 3: STOP zwischen Auswahl und Start eines bereits laufenden Watchers ---
+fresh() {  # frische Basis + Stub (zaehlt Aufrufe); setzt P, CTRL, LOCK
+  [ -n "${W:-}" ] && { kill -TERM $W 2>/dev/null; wait $W 2>/dev/null; W=""; }
+  export FORGE_BASE="$T/b$1"; P="$FORGE_BASE/post"; CTRL="$P/control"; LOCK="$CTRL/.dispatch.lock"
+  mkdir -p "$P/eingang" "$CTRL"; : > "$LOCK"; : > "$STUB_LOG"
+  printf '#!/usr/bin/env bash\ncat >/dev/null; echo called >> "$STUB_LOG"\nprintf %%s\\n '"'"'{"type":"result","subtype":"success","session_id":"s","result":"ok"}'"'"'\n' > "$CLAUDE_BIN"
+  H="$T/h$1"; mkdir -p "$H"
+  printf '#!/usr/bin/env bash\n: > "%s/sel.entered"\nwhile [ ! -e "%s/sel.go" ]; do sleep 0.1; done\n' "$H" "$H" > "$H/after_select"
+  printf '#!/usr/bin/env bash\n: > "%s/claim.entered"\nwhile [ ! -e "%s/claim.go" ]; do sleep 0.1; done\n' "$H" "$H" > "$H/in_claim"
+  chmod +x "$H/after_select" "$H/in_claim"
+}
+waitfor() { for i in $(seq 1 100); do [ -e "$1" ] && return 0; sleep 0.1; done; return 1; }
+W=""
+
+# test_watcher_running_stop_between_select_and_start
+fresh 1
+FORGE_HOOK_AFTER_SELECT="$H/after_select" bash "$WATCHER" > "$T/w1.out" 2>&1 & W=$!
+sleep 1; printf 'x\n' > "$P/eingang/BRIEF_R1.md"
+check "select/start: Watcher hat den Brief gewaehlt (Hook erreicht)" waitfor "$H/sel.entered"
+bash "$FSTOP" "gap" >/dev/null                      # Lock ist frei (Watcher steht im Hook, ausserhalb des Lock-Abschnitts) -> STOP sofort gesetzt
+: > "$H/sel.go"; sleep 2
+check "select/start: Brief NICHT gestartet (Stub nie gerufen)"   test ! -s "$STUB_LOG"
+check "select/start: Brief bleibt in eingang"                      test -f "$P/eingang/BRIEF_R1.md"
+check "select/start: kein Report, kein Archiv"                     bash -c "! ls '$P'/ausgang/REPORT_* '$P'/erledigt/* 2>/dev/null | grep -q ."
+check "select/start: Log 'paused by STOP'"                         grep -q 'paused by STOP' "$P/log/postbote.log"
+bash "$FREL" >/dev/null
+for i in $(seq 1 80); do [ -s "$STUB_LOG" ] && break; sleep 0.1; done
+check "select/start: nach forge-release laeuft der Brief"          test -s "$STUB_LOG"
+check "select/start: ...und wird archiviert"                       bash -c "sleep 1; ls '$P'/erledigt/*BRIEF_R1.md >/dev/null"
+
+# test_watcher_running_touch_before_locked_check
+fresh 2
+FORGE_HOOK_AFTER_SELECT="$H/after_select" bash "$WATCHER" > "$T/w2.out" 2>&1 & W=$!
+sleep 1; printf 'x\n' > "$P/eingang/BRIEF_R2.md"
+waitfor "$H/sel.entered"
+: > "$CTRL/STOP"                                    # rohes touch, ohne forge-stop, vor der gesperrten Pruefung
+: > "$H/sel.go"; sleep 2
+check "touch vor gesperrter Pruefung: nicht gestartet"            test ! -s "$STUB_LOG"
+check "touch vor gesperrter Pruefung: Brief liegt in eingang"     test -f "$P/eingang/BRIEF_R2.md"
+check "touch vor gesperrter Pruefung: Log paused"                 grep -q 'paused by STOP' "$P/log/postbote.log"
+
+# test_watcher_lock_held_during_claim
+fresh 3
+FORGE_HOOK_IN_CLAIM="$H/in_claim" bash "$WATCHER" > "$T/w3.out" 2>&1 & W=$!
+sleep 1; printf 'x\n' > "$P/eingang/BRIEF_R3.md"
+check "claim: Watcher steht im gesperrten Abschnitt"              waitfor "$H/claim.entered"
+bash "$FSTOP" "during-claim" >/dev/null 2>&1 & S=$!
+sleep 0.8
+check "claim: forge-stop blockiert (STOP noch nicht gesetzt)"     test ! -e "$CTRL/STOP"
+check "claim: Brief noch nicht gestartet"                         test ! -s "$STUB_LOG"
+: > "$H/claim.go"                                   # Watcher setzt den Start fort: Executor spawnen, Lock freigeben
+wait $S
+check "claim: danach setzt forge-stop STOP"                       test -f "$CTRL/STOP"
+for i in $(seq 1 50); do [ -s "$STUB_LOG" ] && break; sleep 0.1; done
+check "claim: Brief startete vor STOP (laeuft/fertig, nicht abgebrochen)" bash -c "test -s '$STUB_LOG' && sleep 1 && ls '$P'/ausgang/REPORT_BRIEF_R3_* >/dev/null && grep -q 'Exit-Code: 0' '$P'/ausgang/REPORT_BRIEF_R3_*"
+check "claim: Lock nach dem Spawn wieder frei"                    bash -c "flock -n -w 2 '$LOCK' true"
+# langer Lauf haelt das Lock NICHT: forge-stop waehrend der Executor laeuft kehrt sofort zurueck
+fresh 4
+printf '#!/usr/bin/env bash\ncat >/dev/null; echo called >> "$STUB_LOG"; sleep 4\nprintf %%s\\n '"'"'{"type":"result","subtype":"success","session_id":"s","result":"ok"}'"'"'\n' > "$CLAUDE_BIN"
+bash "$WATCHER" > "$T/w4.out" 2>&1 & W=$!
+sleep 1; printf 'x\n' > "$P/eingang/BRIEF_R4.md"; for i in $(seq 1 50); do [ -s "$STUB_LOG" ] && break; sleep 0.1; done
+t0=$(date +%s); FORGE_LOCK_TIMEOUT=2 bash "$FSTOP" >/dev/null 2>&1; rc=$?; t1=$(date +%s)
+check "laufender Brief haelt das Lock nicht (forge-stop sofort, rc 0)" bash -c "[ $rc = 0 ] && [ $((t1-t0)) -le 1 ]"
+kill -TERM $W 2>/dev/null; wait $W 2>/dev/null; W=""
+
 echo "---- $PASS bestanden, $FAIL fehlgeschlagen"
 [ "$FAIL" = 0 ]

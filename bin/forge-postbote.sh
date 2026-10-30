@@ -19,6 +19,10 @@
 # STOP (F5b): existiert $POST/control/STOP (FORGE_STOP_FILE), beginnt der Watcher KEINEN neuen Brief (Pruefung unmittelbar vor der Auswahl des naechsten Briefs; er pollt
 #   weiter, Heartbeat laeuft, Restart-Anforderungen werden bedient) und loggt einmal "paused by STOP" / "resumed". Laufende Briefe werden nicht beendet (F5c).
 #   Setzen/Loesen am Host bevorzugt mit bin/forge-stop / bin/forge-release (nehmen das Dispatch-Lock control/.dispatch.lock).
+#   Start eines Briefs = "letzte STOP-Pruefung -> Executor starten" laeuft UNTER DEMSELBEN flock (control/.dispatch.lock, FD 8): ist STOP im Lock gesetzt, wird der Brief nicht
+#   angefasst (bleibt in eingang/, "paused by STOP"). Das Lock wird nach dem Spawn freigegeben (Laeufe dauern Stunden). forge-stop wartet auf das Lock => entweder
+#   startete der Brief vor STOP (laeuft weiter, F5c) oder gar nicht. Ein rohes `touch STOP` ohne forge-stop ist best effort: garantiert nur fuer Briefs, deren gesperrte
+#   Startpruefung nach dem touch liegt. Test-Haken (nur Tests): FORGE_HOOK_AFTER_SELECT / FORGE_HOOK_IN_CLAIM = ausfuehrbare Datei, nach der Auswahl bzw. im Lock-Abschnitt.
 # Flags: --once  (eine Runde: alle faelligen Briefe abarbeiten, dann Ende)
 set -u
 
@@ -40,6 +44,7 @@ export PATH="${HOME:-/srv/forge/home}/.local/bin:$PATH"
 
 RESTART_FLAG="$POST/state/restart-requested"
 STOP_FILE="${FORGE_STOP_FILE:-$POST/control/STOP}"; PAUSED=0
+LOCK_FILE="${FORGE_DISPATCH_LOCK:-$POST/control/.dispatch.lock}"; LOCKED=0
 EIN="$POST/eingang"; AUS="$POST/ausgang"; ERL="$POST/erledigt"
 LOGD="$POST/log"; STATE="$POST/state"
 mkdir -p "$EIN" "$AUS" "$ERL" "$LOGD" "$STATE" "$WORK" || { echo "FEHLER: Verzeichnisse nicht anlegbar unter $BASE" >&2; exit 1; }
@@ -154,10 +159,29 @@ next_brief() {
   return 1
 }
 
+# claim_lock: Dispatch-Lock nehmen, dann STOP pruefen. 0 = gesperrt + kein STOP (Aufrufer muss unclaim rufen); 1 = STOP (Lock frei); 2 = Lock nicht verfuegbar (fail closed).
+# Ohne Control-Verzeichnis (aeltere Installation) gibt es weder STOP noch Lock: 0 ohne Lock.
+claim_lock() {
+  if [ -d "$(dirname "$LOCK_FILE")" ]; then
+    exec 8>>"$LOCK_FILE" 2>/dev/null || return 2
+    flock -w "${FORGE_LOCK_TIMEOUT:-10}" 8 || { exec 8>&-; return 2; }
+    LOCKED=1
+  fi
+  if [ -e "$STOP_FILE" ] || [ -L "$STOP_FILE" ]; then unclaim; return 1; fi
+  if [ -n "${FORGE_HOOK_IN_CLAIM:-}" ] && [ -x "$FORGE_HOOK_IN_CLAIM" ]; then "$FORGE_HOOK_IN_CLAIM" 8>&-; fi
+  return 0
+}
+unclaim() {   # LOCK_UN wirkt auf die offene Dateibeschreibung, also auch dann, wenn ein Kindprozess die FD noch geerbt hat
+  [ "$LOCKED" = 1 ] || return 0
+  flock -u 8 2>/dev/null; exec 8>&-; LOCKED=0
+}
+
 process() {
   local name="$1" base art k fort model nonce="" exec aufwand oldexec="" rejected=0 sid="" start end t0 t1 dur rc=0
   local ts run json err head body cost reportname
   base="${name%.md}"
+  claim_lock; local c=$?
+  [ "$c" = 0 ] || return $((70 + c))   # 71 = STOP, 72 = Lock nicht verfuegbar: Brief unangetastet in eingang/
   ts=$(utc)
   head=$(mktemp "$STATE/.head.XXXXXX"); body=$(mktemp "$STATE/.body.XXXXXX")
 
@@ -194,6 +218,7 @@ process() {
     write_report "$AUS/$reportname" "$head" "$body"
     printf '%s %s %s rc=%s dauer=%ss session=%s\n' "$(utcl)" "$name" "-" "REJECTED" 0 "-" >> "$LOGD/postbote.log"
     rm -f "$head" "$body"
+    unclaim
     return 0
   fi
 
@@ -237,12 +262,14 @@ process() {
 
   local newsid="" result="" cost="" usage=""
   if [ -n "$skip" ]; then
+    unclaim
     rc=2; [ "$rejected" = 1 ] && rc=REJECTED
     : > "$json"; printf '%s\n' "$skip" > "$err"
     printf '%s\n' "FEHLER: $skip" > "$body"
   else
-    ( forge_exec_env "$exec" "${ts}_$name" "${k%%-*}" "$k"; cd "$WORK" && exec timeout "${FORGE_MAX_SECONDS:-14400}" "$bin" "${args[@]}" < "$EIN/$name" > "$json" 2> "$err" 9>&- ) &
+    ( forge_exec_env "$exec" "${ts}_$name" "${k%%-*}" "$k"; cd "$WORK" && exec timeout "${FORGE_MAX_SECONDS:-14400}" "$bin" "${args[@]}" < "$EIN/$name" > "$json" 2> "$err" 9>&- 8>&- ) &
     CHILD=$!
+    unclaim      # Executor ist gestartet: Lock frei (forge-stop darf jetzt; der laufende Brief bleibt unberuehrt)
     hb_start
     wait "$CHILD"; rc=$?
     # wait kann durch Signal unterbrochen werden -> erneut auf Ende warten
@@ -327,7 +354,18 @@ while :; do
   fi
   if [ "$PAUSED" = 1 ]; then printf '%s resumed (STOP removed)\n' "$(utcl)" >> "$LOGD/postbote.log"; PAUSED=0; fi
   if name=$(next_brief); then
-    process "$name"
+    if [ -n "${FORGE_HOOK_AFTER_SELECT:-}" ] && [ -x "$FORGE_HOOK_AFTER_SELECT" ]; then "$FORGE_HOOK_AFTER_SELECT" "$name" 9>&-; fi
+    process "$name"; prc=$?
+    if [ "$prc" = 71 ] || [ "$prc" = 72 ]; then   # STOP bzw. Lock-Problem im gesperrten Startabschnitt: nichts gestartet
+      if [ "$PAUSED" = 0 ]; then
+        if [ "$prc" = 71 ]; then printf '%s paused by STOP (%s)\n' "$(utcl)" "$STOP_FILE" >> "$LOGD/postbote.log"
+        else printf '%s paused: dispatch lock unavailable (%s)\n' "$(utcl)" "$LOCK_FILE" >> "$LOGD/postbote.log"; fi
+        PAUSED=1
+      fi
+      [ "$ONCE" = 1 ] && break
+      sleep "$POLL" 9>&- & wait $!
+      continue
+    fi
     [ "$STOP" = 1 ] && break
     continue   # sofort naechsten pruefen
   fi
