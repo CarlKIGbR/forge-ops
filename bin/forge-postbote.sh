@@ -19,6 +19,7 @@
 # STOP (F5b): existiert $POST/control/STOP (FORGE_STOP_FILE), beginnt der Watcher KEINEN neuen Brief (Pruefung unmittelbar vor der Auswahl des naechsten Briefs; er pollt
 #   weiter, Heartbeat laeuft, Restart-Anforderungen werden bedient) und loggt einmal "paused by STOP" / "resumed". Laufende Briefe werden nicht beendet (F5c).
 #   Setzen/Loesen am Host bevorzugt mit bin/forge-stop / bin/forge-release (nehmen das Dispatch-Lock control/.dispatch.lock).
+#   Ohne control/ legt der Watcher es an (2775); schlaegt Anlegen/Locken fehl, startet nichts ("control unavailable"), er pollt weiter.
 #   Start eines Briefs = "letzte STOP-Pruefung -> Executor starten" laeuft UNTER DEMSELBEN flock (control/.dispatch.lock, FD 8): ist STOP im Lock gesetzt, wird der Brief nicht
 #   angefasst (bleibt in eingang/, "paused by STOP"). Das Lock wird nach dem Spawn freigegeben (Laeufe dauern Stunden). forge-stop wartet auf das Lock => entweder
 #   startete der Brief vor STOP (laeuft weiter, F5c) oder gar nicht. Ein rohes `touch STOP` ohne forge-stop ist best effort: garantiert nur fuer Briefs, deren gesperrte
@@ -160,13 +161,16 @@ next_brief() {
 }
 
 # claim_lock: Dispatch-Lock nehmen, dann STOP pruefen. 0 = gesperrt + kein STOP (Aufrufer muss unclaim rufen); 1 = STOP (Lock frei); 2 = Lock nicht verfuegbar (fail closed).
-# Ohne Control-Verzeichnis (aeltere Installation) gibt es weder STOP noch Lock: 0 ohne Lock.
+# Fail closed: ohne Lock startet nie ein Brief. Fehlt control/, wird es angelegt (Modus 2775 wie im RUNBOOK/create_planner_role.sh); gelingt Anlegen oder Locken nicht -> 2.
 claim_lock() {
-  if [ -d "$(dirname "$LOCK_FILE")" ]; then
-    exec 8>>"$LOCK_FILE" 2>/dev/null || return 2
-    flock -w "${FORGE_LOCK_TIMEOUT:-10}" 8 || { exec 8>&-; return 2; }
-    LOCKED=1
+  local cdir; cdir="$(dirname "$LOCK_FILE")"
+  if [ ! -d "$cdir" ]; then
+    mkdir -p "$cdir" 2>/dev/null && chmod 2775 "$cdir" 2>/dev/null
+    [ -d "$cdir" ] || return 2
   fi
+  exec 8>>"$LOCK_FILE" 2>/dev/null || return 2
+  flock -w "${FORGE_LOCK_TIMEOUT:-10}" 8 || { exec 8>&-; return 2; }
+  LOCKED=1
   if [ -e "$STOP_FILE" ] || [ -L "$STOP_FILE" ]; then unclaim; return 1; fi
   if [ -n "${FORGE_HOOK_IN_CLAIM:-}" ] && [ -x "$FORGE_HOOK_IN_CLAIM" ]; then "$FORGE_HOOK_IN_CLAIM" 8>&-; fi
   return 0
@@ -359,7 +363,7 @@ while :; do
     if [ "$prc" = 71 ] || [ "$prc" = 72 ]; then   # STOP bzw. Lock-Problem im gesperrten Startabschnitt: nichts gestartet
       if [ "$PAUSED" = 0 ]; then
         if [ "$prc" = 71 ]; then printf '%s paused by STOP (%s)\n' "$(utcl)" "$STOP_FILE" >> "$LOGD/postbote.log"
-        else printf '%s paused: dispatch lock unavailable (%s)\n' "$(utcl)" "$LOCK_FILE" >> "$LOGD/postbote.log"; fi
+        else printf '%s control unavailable: dispatch lock/dir not usable, no brief started (%s)\n' "$(utcl)" "$LOCK_FILE" >> "$LOGD/postbote.log"; fi
         PAUSED=1
       fi
       [ "$ONCE" = 1 ] && break

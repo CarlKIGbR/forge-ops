@@ -128,5 +128,62 @@ t0=$(date +%s); FORGE_LOCK_TIMEOUT=2 bash "$FSTOP" >/dev/null 2>&1; rc=$?; t1=$(
 check "laufender Brief haelt das Lock nicht (forge-stop sofort, rc 0)" bash -c "[ $rc = 0 ] && [ $((t1-t0)) -le 1 ]"
 kill -TERM $W 2>/dev/null; wait $W 2>/dev/null; W=""
 
+
+# --- Rework 4: fehlendes control/ : fail closed, nie ohne Lock starten ---
+fresh_nocontrol() { fresh "$1"; rm -rf "$CTRL"; }
+
+# test_watcher_missing_control_dir_creates_and_locks
+fresh_nocontrol 5
+FORGE_HOOK_IN_CLAIM="$H/in_claim" bash "$WATCHER" > "$T/w5.out" 2>&1 & W=$!
+sleep 1; printf 'x\n' > "$P/eingang/BRIEF_C1.md"
+check "missing control: Watcher erreicht den gesperrten Abschnitt" waitfor "$H/claim.entered"
+check "missing control: control/ angelegt, Modus 2775"             bash -c "[ -d '$CTRL' ] && [ \"\$(stat -c %a '$CTRL')\" = 2775 ]"
+check "missing control: Lock wird wirklich gehalten"               bash -c "! flock -n '$LOCK' true"
+check "missing control: noch nichts gestartet"                      test ! -s "$STUB_LOG"
+: > "$H/claim.go"
+for i in $(seq 1 60); do [ -s "$STUB_LOG" ] && break; sleep 0.1; done
+check "missing control: Brief startet nach dem gesperrten Abschnitt" test -s "$STUB_LOG"
+
+# test_watcher_control_uncreatable_does_not_start (Elternverzeichnis read-only)
+if [ "$(id -u)" = 0 ]; then echo "SKIP  uncreatable (root ignoriert Dateirechte)"; else
+fresh_nocontrol 6
+mkdir -p "$P/log" "$P/state" "$P/ausgang" "$P/erledigt"
+chmod 555 "$P"
+bash "$WATCHER" > "$T/w6.out" 2>&1 & W=$!
+sleep 1; printf 'x\n' > "$P/eingang/BRIEF_C2.md"; sleep 3
+check "uncreatable: Brief nicht gestartet"                        test ! -s "$STUB_LOG"
+check "uncreatable: Brief bleibt in eingang"                      test -f "$P/eingang/BRIEF_C2.md"
+check "uncreatable: Log 'control unavailable'"                    grep -q 'control unavailable' "$P/log/postbote.log"
+check "uncreatable: Watcher pollt weiter (lebt, Heartbeat frisch)" bash -c "kill -0 $W && [ \$(( \$(date +%s) - \$(date -u -d \"\$(cat '$P/state/heartbeat')\" +%s) )) -le 5 ]"
+chmod 755 "$P"                                                     # Problem behoben -> naechster Poll startet
+for i in $(seq 1 60); do [ -s "$STUB_LOG" ] && break; sleep 0.1; done
+check "uncreatable: nach Behebung startet der Brief (control/ angelegt)" bash -c "test -s '$STUB_LOG' && test -d '$CTRL'"
+chmod 755 "$P" 2>/dev/null
+fi
+
+# test_forge_stop_missing_control_dir_serialized
+fresh_nocontrol 7
+FORGE_HOOK_AFTER_SELECT="$H/after_select" bash "$WATCHER" > "$T/w7.out" 2>&1 & W=$!
+sleep 1; printf 'x\n' > "$P/eingang/BRIEF_C3.md"
+waitfor "$H/sel.entered"
+check "forge-stop ohne control/: control/ noch weg (Watcher steht im Hook)" test ! -d "$CTRL"
+bash "$FSTOP" "gap-nodir" >/dev/null 2>&1; rc=$?
+check "forge-stop ohne control/: Exit 0, control/ + Lock-Datei + STOP angelegt" bash -c "[ $rc = 0 ] && [ -f '$LOCK' ] && [ -f '$CTRL/STOP' ] && [ \"\$(stat -c %a '$CTRL')\" = 2775 ]"
+: > "$H/sel.go"; sleep 2
+check "forge-stop ohne control/: Brief NICHT gestartet"            test ! -s "$STUB_LOG"
+check "forge-stop ohne control/: Brief bleibt in eingang"          test -f "$P/eingang/BRIEF_C3.md"
+bash "$FREL" >/dev/null
+for i in $(seq 1 60); do [ -s "$STUB_LOG" ] && break; sleep 0.1; done
+check "forge-stop ohne control/: nach forge-release startet er"    test -s "$STUB_LOG"
+# forge-stop liefert 0 nur mit gehaltenem Lock: haelt der Watcher es (control/ vom Watcher angelegt), wartet/scheitert forge-stop
+fresh_nocontrol 8
+FORGE_HOOK_IN_CLAIM="$H/in_claim" bash "$WATCHER" > "$T/w8.out" 2>&1 & W=$!
+sleep 1; printf 'x\n' > "$P/eingang/BRIEF_C4.md"; waitfor "$H/claim.entered"
+FORGE_LOCK_TIMEOUT=1 bash "$FSTOP" >/dev/null 2>&1; rc=$?
+check "forge-stop: Exit 1 und kein STOP, solange der Watcher das Lock haelt" bash -c "[ $rc = 1 ] && [ ! -e '$CTRL/STOP' ]"
+: > "$H/claim.go"
+kill -TERM $W 2>/dev/null; wait $W 2>/dev/null; W=""
+check "forge-stop: STOP-Schreiben steht nach flock im Skript"      bash -c "[ \$(grep -n 'flock -w' '$FSTOP' | head -1 | cut -d: -f1) -lt \$(grep -n '> \"\$CTRL/STOP\"' '$FSTOP' | head -1 | cut -d: -f1) ]"
+
 echo "---- $PASS bestanden, $FAIL fehlgeschlagen"
 [ "$FAIL" = 0 ]

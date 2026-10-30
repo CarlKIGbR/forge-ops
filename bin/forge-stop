@@ -7,7 +7,8 @@ set -eu
 BASE="${FORGE_BASE:-/srv/forge}"
 CTRL="${FORGE_CONTROL_DIR:-$BASE/post/control}"
 reason="${1:-manual}"; reason="${reason//$'\n'/ }"
-mkdir -p "$CTRL" || { echo "forge-stop: $CTRL nicht anlegbar" >&2; exit 2; }
+# control/ fehlt? anlegen (2775, wie der Watcher); STOP wird nie gesetzt, ohne dass das Lock gehalten wurde
+mkdir -p "$CTRL" && chmod 2775 "$CTRL" 2>/dev/null; [ -d "$CTRL" ] || { echo "forge-stop: $CTRL nicht anlegbar" >&2; exit 2; }
 exec 8>>"$CTRL/.dispatch.lock" || { echo "forge-stop: Lock-Datei nicht oeffenbar" >&2; exit 2; }
 flock -w "${FORGE_LOCK_TIMEOUT:-10}" 8 || { echo "forge-stop: Dispatch-Lock nicht erhalten (laeuft gerade eine Veroeffentlichung?)" >&2; exit 1; }
 printf 'STOP %s by host:%s (%s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${USER:-$(id -un)}" "$reason" > "$CTRL/STOP"
