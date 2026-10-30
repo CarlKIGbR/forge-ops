@@ -16,6 +16,9 @@
 #           FORGE_PERMISSION_MODE (bypassPermissions), FORGE_POLL (5),
 #           FORGE_MIN_AGE (3), CLAUDE_BIN (claude), CODEX_BIN (codex)
 # Neustart: bin/forge-request-restart.sh "<grund>" (Flag state/restart-requested, wirkt nur zwischen Runs). SIGTERM waehrend eines Runs wird bis zu dessen Ende aufgeschoben.
+# STOP (F5b): existiert $POST/control/STOP (FORGE_STOP_FILE), beginnt der Watcher KEINEN neuen Brief (Pruefung unmittelbar vor der Auswahl des naechsten Briefs; er pollt
+#   weiter, Heartbeat laeuft, Restart-Anforderungen werden bedient) und loggt einmal "paused by STOP" / "resumed". Laufende Briefe werden nicht beendet (F5c).
+#   Setzen/Loesen am Host bevorzugt mit bin/forge-stop / bin/forge-release (nehmen das Dispatch-Lock control/.dispatch.lock).
 # Flags: --once  (eine Runde: alle faelligen Briefe abarbeiten, dann Ende)
 set -u
 
@@ -36,6 +39,7 @@ umask 0002
 export PATH="${HOME:-/srv/forge/home}/.local/bin:$PATH"
 
 RESTART_FLAG="$POST/state/restart-requested"
+STOP_FILE="${FORGE_STOP_FILE:-$POST/control/STOP}"; PAUSED=0
 EIN="$POST/eingang"; AUS="$POST/ausgang"; ERL="$POST/erledigt"
 LOGD="$POST/log"; STATE="$POST/state"
 mkdir -p "$EIN" "$AUS" "$ERL" "$LOGD" "$STATE" "$WORK" || { echo "FEHLER: Verzeichnisse nicht anlegbar unter $BASE" >&2; exit 1; }
@@ -314,6 +318,14 @@ while :; do
     printf '%s RESTART requested by %s\n' "$(utcl)" "$rid" >> "$LOGD/postbote.log"
     exit 0   # systemd (Restart=always) startet neu
   fi
+  # Kill-Switch: nichts Neues starten, solange STOP existiert (auch Symlink/Verzeichnis zaehlt)
+  if [ -e "$STOP_FILE" ] || [ -L "$STOP_FILE" ]; then
+    if [ "$PAUSED" = 0 ]; then printf '%s paused by STOP (%s)\n' "$(utcl)" "$STOP_FILE" >> "$LOGD/postbote.log"; PAUSED=1; fi
+    [ "$ONCE" = 1 ] && break
+    sleep "$POLL" 9>&- & wait $!
+    continue
+  fi
+  if [ "$PAUSED" = 1 ]; then printf '%s resumed (STOP removed)\n' "$(utcl)" >> "$LOGD/postbote.log"; PAUSED=0; fi
   if name=$(next_brief); then
     process "$name"
     [ "$STOP" = 1 ] && break

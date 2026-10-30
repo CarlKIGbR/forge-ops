@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# forge-stop ["<grund>"] - Kill-Switch setzen: legt $FORGE_BASE/post/control/STOP an, NACHDEM das Dispatch-Lock (control/.dispatch.lock, flock) erworben wurde.
+# Das Lock halten forge-mcp-Dispatches von der letzten STOP-Pruefung bis nach der Veroeffentlichung; so wirkt ein Stop entweder vor der Pruefung (Dispatch abgelehnt)
+# oder erst nach dem fertigen Brief - und der Watcher (forge-postbote.sh) startet danach keinen neuen Brief mehr. Laufende Briefe bleiben unberuehrt.
+# Bevorzugter Host-Befehl (statt `touch`). Exit 0 = gesetzt, 1 = Lock nicht erhalten (FORGE_LOCK_TIMEOUT s, Standard 10), 2 = Verzeichnis/Aufruf.
+set -eu
+BASE="${FORGE_BASE:-/srv/forge}"
+CTRL="${FORGE_CONTROL_DIR:-$BASE/post/control}"
+reason="${1:-manual}"; reason="${reason//$'\n'/ }"
+mkdir -p "$CTRL" || { echo "forge-stop: $CTRL nicht anlegbar" >&2; exit 2; }
+exec 8>>"$CTRL/.dispatch.lock" || { echo "forge-stop: Lock-Datei nicht oeffenbar" >&2; exit 2; }
+flock -w "${FORGE_LOCK_TIMEOUT:-10}" 8 || { echo "forge-stop: Dispatch-Lock nicht erhalten (laeuft gerade eine Veroeffentlichung?)" >&2; exit 1; }
+printf 'STOP %s by host:%s (%s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${USER:-$(id -un)}" "$reason" > "$CTRL/STOP"
+chmod 0664 "$CTRL/STOP" 2>/dev/null || true
+echo "STOP gesetzt: $CTRL/STOP"

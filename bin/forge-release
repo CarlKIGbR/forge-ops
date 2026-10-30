@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# forge-release - Kill-Switch loesen: entfernt $FORGE_BASE/post/control/STOP unter dem Dispatch-Lock (siehe forge-stop). Idempotent.
+# Exit 0 = frei, 1 = Lock nicht erhalten, 2 = Verzeichnis/Aufruf.
+set -eu
+BASE="${FORGE_BASE:-/srv/forge}"
+CTRL="${FORGE_CONTROL_DIR:-$BASE/post/control}"
+[ -d "$CTRL" ] || { echo "kein Control-Verzeichnis ($CTRL): nichts zu loesen"; exit 0; }
+exec 8>>"$CTRL/.dispatch.lock" || { echo "forge-release: Lock-Datei nicht oeffenbar" >&2; exit 2; }
+flock -w "${FORGE_LOCK_TIMEOUT:-10}" 8 || { echo "forge-release: Dispatch-Lock nicht erhalten" >&2; exit 1; }
+rm -f "$CTRL/STOP"
+echo "STOP geloest: $CTRL/STOP"
