@@ -55,3 +55,9 @@ Tests: `tests/test_write_result.sh`. Kein Watcher-Neustart noetig (reines Werkze
 `bin/forge-run-job` startet einen Auftrag nur, wenn der Graph ihn bestellt hat: unmittelbar vor dem Start wird der Dispatch-Eintrag (`core.graph_run_orders`: Nonce, graph_run_id, sha256 der Auftragsdatei, Zustand `published`) atomar auf `running` gesetzt
 (`docker exec -i $FORGE_PG_CONTAINER psql ...`, Standard `forge-postgres-1`; Test: `FORGE_RUN_ORDER_PSQL` = JSON-Liste des psql-Aufrufs). Kein Eintrag / andere sha256 / anderer graph_run_id / schon verbraucht => Exit 65, Datenbank nicht erreichbar => Exit 69, jeweils OHNE Wirkung
 (auch wenn der Watcher die Datei vor dem Importer aufgreift). Der Dateiname muss `...n-<nonce>.md` mit dem Nonce des Auftrags tragen. Tests: `tests/test_run_kind.sh` (Abschnitt 7b, mit `tests/fake-psql` als Nachbildung der Verbrauchs-Semantik); die echte DB-Semantik pruefen die Kern-Tests `test_f5c2_s2c_runorders.py`.
+
+## DOCKER-USER fuer den forge-nodehub (N1)
+`bin/forge-docker-user.sh --hub` verwaltet einen zweiten, unabhaengigen Regelsatz: TCP/8094 auf 192.168.10.4 nur aus 192.168.10.0/29 und 192.168.30.0/29 (nicht aus dem VPN 10.200.0.0/29), sonst DROP
+(forge-node Design 5.1). Eigener Tag `forge-nodehub`, eigener Rollback-Timer-Prefix, eigene Marke `hub-rules-confirmed`; die Edge-Regeln (443/8443) bleiben unveraendert. Ablauf wie beim Edge:
+`sudo forge-docker-user.sh --hub` (Timer 300 s) -> Verbindung pruefen -> `sudo forge-docker-user.sh --confirm --hub`. Ein normales `--restore` (Boot) stellt bestaetigte Hub-Regeln mit her.
+Nichts davon ist installiert oder angewendet (N1 liefert Code + Tests). Tests: `tests/test_docker_user_hub.sh`.
