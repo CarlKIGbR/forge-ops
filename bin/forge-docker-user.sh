@@ -8,6 +8,10 @@
 #   sudo forge-docker-user.sh --restore     (von der Unit beim Boot) bestaetigte Regeln ohne Timer wiederherstellen;
 #                                           ohne "bestaetigt" Exit 1 -> forge-edge.service startet nicht
 #   forge-docker-user.sh --dry-run [--remove|--install-unit|--confirm]   nur die Kommandos ausgeben, nichts aendern
+#   Zusatz --hub (apply/--confirm/--remove/--restore/--dry-run): eigener Regelsatz fuer den forge-nodehub (N1, FORGE_NODE.md 5.1): TCP/8094 auf
+#                                           192.168.10.4 nur aus 192.168.10.0/29 und 192.168.30.0/29 (NICHT aus dem VPN 10.200.0.0/29), sonst DROP.
+#                                           Eigener Tag (forge-nodehub), eigener Rollback-Timer-Prefix, eigene "bestaetigt"-Marke; die Edge-Regeln bleiben unberuehrt.
+#                                           Ein normales --restore (Boot) stellt die Hub-Regeln mit wieder her, wenn sie bestaetigt wurden.
 #
 # Erlaubt 10.200.0.0/29, 192.168.10.0/29, 192.168.30.0/29 auf 192.168.10.4:443 und :8443, alles andere
 # auf diese Ziele wird verworfen. Andere Ports, ufw und andere Chains bleiben unberuehrt.
@@ -32,31 +36,49 @@ UNIT_SRC="${FORGE_EDGE_UNIT_SRC:-/srv/forge/work/forge-edge/systemd}"
 UNIT_DST="${FORGE_FW_UNIT_DST:-/etc/systemd/system}"
 SBIN_COPY="${FORGE_FW_SBIN:-/usr/local/sbin}/forge-docker-user.sh"
 UNITS=(forge-docker-user.service forge-edge.service)
+HUB_IP="${HUB_IP:-192.168.10.4}"
+HUB_PORT=8094
+HUB_NETS=(192.168.10.0/29 192.168.30.0/29)
+HUB_TAG=forge-nodehub
+HUB_UNIT_PREFIX=forge-docker-user-hub-rollback
+HUB_CONFIRMED="$STATE_DIR/hub-rules-confirmed"
 
 mode=apply
 dry=0
+hub=0
 for a in "$@"; do
     case "$a" in
+        --hub) hub=1 ;;
         --confirm) mode=confirm ;;
         --remove) mode=remove ;;
         --restore) mode=restore ;;
         --install-unit) mode=install ;;
         --dry-run) dry=1 ;;
-        -h|--help) sed -n '2,19p' "$SELF"; exit 0 ;;
+        -h|--help) sed -n '2,24p' "$SELF"; exit 0 ;;
         *) echo "unbekannte Option: $a" >&2; exit 2 ;;
     esac
 done
 
 # Regel-Spezifikationen (ohne Aktion/Chain), in der Reihenfolge, in der sie in der Chain stehen sollen
 specs=()
-for p in "${PORTS[@]}"; do
-    for n in "${NETS[@]}"; do
-        specs+=("-p tcp -s $n -m conntrack --ctorigdst $EDGE_IP --ctorigdstport $p --ctdir ORIGINAL -m comment --comment $TAG -j ACCEPT")
+if [ "$hub" = 1 ]; then
+    [ "$mode" != install ] || { echo "--hub und --install-unit schliessen sich aus (die Units gehoeren zum Edge-Regelsatz)" >&2; exit 2; }
+    TAG=$HUB_TAG; UNIT_PREFIX=$HUB_UNIT_PREFIX; CONFIRMED=$HUB_CONFIRMED; SET_ARG=" --hub"
+    for n in "${HUB_NETS[@]}"; do
+        specs+=("-p tcp -s $n -m conntrack --ctorigdst $HUB_IP --ctorigdstport $HUB_PORT --ctdir ORIGINAL -m comment --comment $TAG -j ACCEPT")
     done
-done
-for p in "${PORTS[@]}"; do
-    specs+=("-p tcp -m conntrack --ctorigdst $EDGE_IP --ctorigdstport $p --ctdir ORIGINAL -m comment --comment $TAG -j DROP")
-done
+    specs+=("-p tcp -m conntrack --ctorigdst $HUB_IP --ctorigdstport $HUB_PORT --ctdir ORIGINAL -m comment --comment $TAG -j DROP")
+else
+    SET_ARG=""
+    for p in "${PORTS[@]}"; do
+        for n in "${NETS[@]}"; do
+            specs+=("-p tcp -s $n -m conntrack --ctorigdst $EDGE_IP --ctorigdstport $p --ctdir ORIGINAL -m comment --comment $TAG -j ACCEPT")
+        done
+    done
+    for p in "${PORTS[@]}"; do
+        specs+=("-p tcp -m conntrack --ctorigdst $EDGE_IP --ctorigdstport $p --ctdir ORIGINAL -m comment --comment $TAG -j DROP")
+    done
+fi
 
 run() {
     if [ "$dry" = 1 ]; then echo "$*"; else "$@"; fi
@@ -123,7 +145,8 @@ check_env() {
 arm_timer() {
     local unit
     unit="$UNIT_PREFIX-$(date +%s)-$$"
-    systemd-run --unit="$unit" --on-active="${ROLLBACK_SECONDS}s" "$SELF" --remove >/dev/null || return 1
+    # shellcheck disable=SC2086  # SET_ARG ist leer oder " --hub"
+    systemd-run --unit="$unit" --on-active="${ROLLBACK_SECONDS}s" "$SELF" --remove$SET_ARG >/dev/null || return 1
     [ "$(systemctl is-active "$unit.timer" 2>/dev/null)" = active ] || { systemctl stop "$unit.timer" 2>/dev/null || true; return 1; }
     ARMED_UNIT="$unit.timer"
 }
@@ -140,7 +163,7 @@ case "$mode" in
         need_root "$@"
         if [ "$dry" = 1 ]; then
             echo "# 1. Rollback-Timer (${ROLLBACK_SECONDS} s) anlegen und pruefen - vor jeder Regel-Aenderung; sonst Abbruch ohne Aenderung:"
-            echo "systemd-run --unit=$UNIT_PREFIX-<zeit>-<pid> --on-active=${ROLLBACK_SECONDS}s $SELF --remove"
+            echo "systemd-run --unit=$UNIT_PREFIX-<zeit>-<pid> --on-active=${ROLLBACK_SECONDS}s $SELF --remove$SET_ARG"
             echo "# 2. vorhandene $TAG-Regeln werden zuerst entfernt (idempotent, iptables -C/-D je Regel)"
             echo "# 3. Regeln einfuegen (Allow je Netz und Port, danach Drop); bei einem Fehler sofort alle $TAG-Regeln entfernen:"
             insert_rules
@@ -156,7 +179,7 @@ case "$mode" in
             exit 1
         fi
         if insert_rules; then
-            echo "Regeln aktiv. Rollback in ${ROLLBACK_SECONDS} s, ausser: sudo $SELF --confirm"
+            echo "Regeln aktiv. Rollback in ${ROLLBACK_SECONDS} s, ausser: sudo $SELF --confirm$SET_ARG"
         else
             echo "Fehler beim Setzen der Regeln - Rollback sofort" >&2
             remove_rules || true
@@ -198,13 +221,19 @@ case "$mode" in
         ;;
     restore)
         need_root "$@"
+        # Boot: Hub-Regeln (eigener Satz) zuerst, aber nur wenn sie je bestaetigt wurden. Ohne Marke aendert sich am Edge-Ablauf nichts.
+        # Docker veroeffentlicht 8094 am Hub-Container am Host-Filter vorbei; ohne diese Regeln waere der Port aus jedem Netz erreichbar.
+        if [ "$hub" = 0 ] && [ -e "$HUB_CONFIRMED" ]; then
+            hubargs=(--restore --hub); [ "$dry" = 1 ] && hubargs+=(--dry-run)
+            "$SELF" "${hubargs[@]}" || echo "Hub-Regeln konnten nicht wiederhergestellt werden - Hub bleibt gesperrt (Port 8094 pruefen!)" >&2
+        fi
         if [ "$dry" = 1 ]; then
             echo "# nur wenn $CONFIRMED existiert:"
             remove_rules
             insert_rules
             exit 0
         fi
-        [ -e "$CONFIRMED" ] || { echo "Regeln nie bestaetigt ($CONFIRMED fehlt) - Edge bleibt gesperrt" >&2; exit 1; }
+        [ -e "$CONFIRMED" ] || { if [ "$hub" = 1 ]; then echo "Hub-Regeln nie bestaetigt ($CONFIRMED fehlt)" >&2; else echo "Regeln nie bestaetigt ($CONFIRMED fehlt) - Edge bleibt gesperrt" >&2; fi; exit 1; }
         check_env
         if remove_rules && insert_rules; then
             echo "bestaetigte Regeln wiederhergestellt"
