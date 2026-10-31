@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""forge-write-result: schreibt die maschinenlesbare Ergebnisdatei einer Graph-Einheit atomar (F5c Teil 2, Design §4.4, M-94).
+
+    forge-write-result --nonce <8hex> <graph_run_id>/<key> <json-datei>
+
+Prueft MINIMAL (damit der Agent Fehler sofort sieht): Groesse <= 256 KB, striktes JSON (Objekt, keine doppelten Schluessel, kein NaN/Infinity), bekanntes `schema` (graph.<rolle>.v1),
+Pflicht- und erlaubte Schluessel dieses Schemas, `nonce` == --nonce, `graph_run_id`/`key` == Pfadangabe. Die inhaltliche Pruefung (Typen, Laengen, Querregeln) und alle Identitaetspruefungen
+gegen den Ledger macht der Graph bei der Aufnahme (forge_core.graph.ingest) - dieses Werkzeug ersetzt sie nicht.
+Schreibt <FORGE_GRAPH_DIR>/<gid>/<key>/result.json: .tmp (O_EXCL) -> fsync -> rename -> fsync(dir). Das Verzeichnis legt der Graph an (vor der Veroeffentlichung); fehlt es oder ist es ein Symlink: Fehler.
+Exit 0 = geschrieben (stdout: "ok <pfad> <sha256>"), 2 = Aufruf, 3 = Datei ungueltig (genau eine Zeile "forge-write-result: <Grund>" auf stderr).
+FORGE_GRAPH_DIR (Standard /srv/forge/post/graph) ist nur fuer Tests ueberschreibbar."""
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+MAX_BYTES = 256 * 1024
+ENVELOPE = ("schema", "nonce", "graph_run_id", "key")
+# Schluesseltabelle je Schema: (Pflicht, optional). Muss mit forge_core.graph.results.SPEC uebereinstimmen (Paritaetstest: forge-core tests/test_f5c2_s2b_write_result.py).
+SCHEMAS = {
+    "graph.build.v1": (("head_sha", "branch", "files_changed", "self_check"), ("notes", "reserved_hits", "finding_responses")),
+    "graph.review.v1": (("verdict", "reviewed_head", "findings"), ("notes",)),
+    "graph.judge.v1": (("recommend", "rulings", "rationale"), ("notes",)),
+    "graph.run.v1": (("job", "ok"), ("script_sha256", "started_at", "ended_at", "detail", "notes")),
+}
+
+
+def fail(code: int, msg: str):
+    sys.stderr.write(f"forge-write-result: {msg}\n")
+    sys.exit(code)
+
+
+def no_dup(pairs):
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError(f"doppelter Schluessel {k[:40]!r}")
+        d[k] = v
+    return d
+
+
+def bad_const(name):
+    raise ValueError(f"{name} ist kein gueltiges JSON")
+
+
+def main(argv):
+    args = argv[1:]
+    if len(args) != 4 or args[0] != "--nonce":
+        fail(2, "Aufruf: forge-write-result --nonce <8hex> <graph_run_id>/<key> <json-datei>")
+    nonce, pathkey, src = args[1], args[2], args[3]
+    if not re.fullmatch(r"[0-9a-f]{8}", nonce):
+        fail(2, "--nonce muss 8 Hex-Zeichen sein")
+    m = re.fullmatch(r"([1-9][0-9]{0,17})/([a-z0-9][a-z0-9_.:-]{0,79})", pathkey)
+    if not m or ".." in pathkey:
+        fail(2, "Pfadangabe muss <graph_run_id>/<key> sein (Key: [a-z0-9_.:-], kein '..')")
+    gid, key = int(m.group(1)), m.group(2)
+    try:
+        fd = os.open(src, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as e:
+        fail(3, f"JSON-Datei nicht lesbar: {e.strerror}")
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            fail(3, "JSON-Datei ist keine regulaere Datei")
+        data = f.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        fail(3, f"JSON-Datei groesser als {MAX_BYTES // 1024} KB")
+    try:
+        obj = json.loads(data.decode("utf-8"), object_pairs_hook=no_dup, parse_constant=bad_const)
+    except (ValueError, RecursionError) as e:
+        fail(3, f"kein gueltiges JSON: {str(e)[:120]}")
+    if not isinstance(obj, dict):
+        fail(3, "JSON muss ein Objekt sein")
+    schema = obj.get("schema")
+    if schema not in SCHEMAS:
+        fail(3, f"unbekanntes schema {str(schema)[:40]!r} (erlaubt: {', '.join(sorted(SCHEMAS))})")
+    required, optional = SCHEMAS[schema]
+    missing = [k for k in ENVELOPE + required if k not in obj]
+    if missing:
+        fail(3, f"Pflichtschluessel fehlen: {', '.join(missing)}")
+    unknown = [k for k in obj if k not in ENVELOPE + required + optional]
+    if unknown:
+        fail(3, f"unbekannte Schluessel: {', '.join(sorted(unknown)[:5])}")
+    if obj["nonce"] != nonce:
+        fail(3, "nonce in der Datei entspricht nicht --nonce (nonce dieser Einheit ist im Brief genannt)")
+    if obj["graph_run_id"] != gid or isinstance(obj["graph_run_id"], bool):
+        fail(3, f"graph_run_id muss {gid} sein")
+    if obj["key"] != key:
+        fail(3, f"key muss {key!r} sein")
+    root = os.environ.get("FORGE_GRAPH_DIR", "/srv/forge/post/graph")
+    for p in (os.path.join(root, str(gid)), os.path.join(root, str(gid), key)):
+        try:
+            if not stat.S_ISDIR(os.lstat(p).st_mode):
+                fail(3, f"Einheiten-Verzeichnis ist kein Verzeichnis: {p}")
+        except FileNotFoundError:
+            fail(3, f"Einheiten-Verzeichnis fehlt (legt der Graph vor der Veroeffentlichung an): {p}")
+    d = os.path.join(root, str(gid), key)
+    final, tmp = os.path.join(d, "result.json"), os.path.join(d, f".result.json.{os.getpid()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o664)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o664)
+        os.rename(tmp, final)
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        fail(3, f"schreiben fehlgeschlagen: {e.strerror}")
+    dfd = os.open(d, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+    print(f"ok {final} {hashlib.sha256(data).hexdigest()}")
+
+
+if __name__ == "__main__":
+    main(sys.argv)
