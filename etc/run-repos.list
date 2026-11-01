@@ -1,0 +1,8 @@
+# Repos, auf die sich RUN-Auftraege (bin/forge-run-job) beziehen duerfen: Verzeichnisnamen unter $FORGE_BASE/work (Standard /srv/forge/work), je ein git-Repo.
+# Spiegel der Repo-Konfiguration des Graphen (forge-core config/graph.yaml folgt in S3a); fehlt die Datei oder der Name, wird der Auftrag abgelehnt (fail closed).
+forge-core
+forge-ops
+forge-docs
+forge-standards
+forge-edge
+forge-node

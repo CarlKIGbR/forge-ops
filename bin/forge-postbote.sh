@@ -4,7 +4,10 @@
 # schreibt Reports nach ausgang/. Strikt sequentiell (flock), Poll alle 5 s.
 #
 # Dateiname: <ART>_<K>[.fortsetzung][.exec-<claude|codex>][.aufwand-<minimal|low|medium|high|xhigh>][.modell-<id>][.n-<8 hex>].md
-#   ART = BRIEF|WEISUNG|NACHFORDERUNG|GO|PING ; K = [A-Za-z0-9-]+
+#   ART = BRIEF|WEISUNG|NACHFORDERUNG|GO|PING|RUN ; K = [A-Za-z0-9-]+
+#   RUN (F5c Teil 2, Slice S2c, Design §4.6): LLM-freier Auftrag. Grammatik NUR `RUN_<K>[.n-<8 hex>].md` - .fortsetzung/.exec-/.aufwand-/.modell- => ABGELEHNT. Der Inhalt ist ein JSON-Auftrag,
+#   den ausschliesslich bin/forge-run-job ausfuehrt (Allowlist, Argument-Regexes, leeres Environment, kein MCP-Token, keine Session, kein state/<K>.session). Report: `Executor: run`, `- Modell: -`,
+#   Body = Auftrag + Ausgabe-Ende (<= 3000 Bytes), Exit-Code = Exit des Auftrags (124 = Zeitlimit FORGE_RUN_MAX_SECONDS, Standard 3900). Beweisspur (W-3) wie bei allen Briefen.
 #   Reihenfolge fest wie oben; .modell- steht vor dem optionalen Nonce .n-<8 hex> (Einwurf-Kennung, lowercase hex), der direkt vor .md steht. Default exec = claude.
 #   exec-codex: "codex exec --json ..." (Thread-ID aus thread.started, Antwort aus
 #   item.completed/agent_message, Tokens aus turn.completed.usage).
@@ -12,7 +15,7 @@
 #   state/<K>.session = Session/Thread-ID, state/<K>.exec = Executor.
 #   aufwand: codex -> -c model_reasoning_effort=<x>; claude -> --effort (minimal wird low).
 #
-# Umgebung: FORGE_BASE (Default /srv/forge), FORGE_MAX_SECONDS (14400),
+# Umgebung: FORGE_BASE (Default /srv/forge), FORGE_MAX_SECONDS (14400), FORGE_RUN_MAX_SECONDS (3900), FORGE_RUN_JOB_BIN (bin/forge-run-job; nur Tests),
 #           FORGE_PERMISSION_MODE (bypassPermissions), FORGE_POLL (5),
 #           FORGE_MIN_AGE (3), CLAUDE_BIN (claude), CODEX_BIN (codex)
 # Neustart: bin/forge-request-restart.sh "<grund>" (Flag state/restart-requested, wirkt nur zwischen Runs). SIGTERM waehrend eines Runs wird bis zu dessen Ende aufgeschoben.
@@ -27,6 +30,7 @@
 # Flags: --once  (eine Runde: alle faelligen Briefe abarbeiten, dann Ende)
 set -u
 
+BINDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE="${FORGE_BASE:-/srv/forge}"
 POST="$BASE/post"
 WORK="$BASE/work"
@@ -189,7 +193,7 @@ process() {
   ts=$(utc)
   head=$(mktemp "$STATE/.head.XXXXXX"); body=$(mktemp "$STATE/.body.XXXXXX")
 
-  local re='^(BRIEF|WEISUNG|NACHFORDERUNG|GO|PING)_([A-Za-z0-9-]+)(\.fortsetzung)?(\.exec-(claude|codex))?(\.aufwand-(minimal|low|medium|high|xhigh))?(\.modell-([A-Za-z0-9._-]*[A-Za-z0-9]))?(\.n-([0-9a-f]{8}))?\.md$'
+  local re='^(BRIEF|WEISUNG|NACHFORDERUNG|GO|PING|RUN)_([A-Za-z0-9-]+)(\.fortsetzung)?(\.exec-(claude|codex))?(\.aufwand-(minimal|low|medium|high|xhigh))?(\.modell-([A-Za-z0-9._-]*[A-Za-z0-9]))?(\.n-([0-9a-f]{8}))?\.md$'
   reportname="REPORT_${base}_${ts}.md"
 
   local ok=0 m
@@ -197,11 +201,17 @@ process() {
     art="${BASH_REMATCH[1]}"; k="${BASH_REMATCH[2]}"
     fort="${BASH_REMATCH[3]}"; exec="${BASH_REMATCH[5]:-claude}"
     aufwand="${BASH_REMATCH[7]}"; model="${BASH_REMATCH[9]}"; nonce="${BASH_REMATCH[11]}"
+    local rexec="${BASH_REMATCH[4]}" rmodel="${BASH_REMATCH[8]}"   # vor dem naechsten =~ sichern (RUN-Pruefung)
     # Greedy-Modell schluckt ein folgendes ".n-<hex>" -> abspalten
     if [[ "$model" =~ ^(.*[A-Za-z0-9])\.n-([0-9a-f]{8})$ ]]; then
       model="${BASH_REMATCH[1]}"; nonce="${BASH_REMATCH[2]}"
     fi
     ok=1
+    # RUN: LLM-freier Auftrag - keine Fortsetzung/Executor/Aufwand/Modell (Design §4.6); Executor-Kennung `run`
+    if [ "$art" = RUN ]; then
+      exec=run
+      if [ -n "$fort" ] || [ -n "$rexec" ] || [ -n "$aufwand" ] || [ -n "$rmodel" ]; then ok=0; fi
+    fi
     [[ "$model" =~ ^\.n-[0-9a-f]{8}$ ]] && ok=0   # ".modell-" ohne echte Modell-ID
     # Modell-IDs duerfen Punkte enthalten -> Marker anderer Segmente darin ablehnen (falsche Reihenfolge)
     m=".$model"
@@ -216,6 +226,7 @@ process() {
     {
       echo "Erwartet: \`<ART>_<K>[.fortsetzung][.exec-<claude|codex>][.aufwand-<minimal|low|medium|high|xhigh>][.modell-<id>][.n-<8 hex>].md\` mit ART in BRIEF|WEISUNG|NACHFORDERUNG|GO|PING und K = [A-Za-z0-9-]+."
       echo "Reihenfolge: \`.fortsetzung\`, \`.exec-\`, \`.aufwand-\`, \`.modell-\` (immer zuletzt). Der Brief wurde nicht ausgefuehrt."
+      echo "RUN-Auftraege: nur \`RUN_<K>[.n-<8 hex>].md\` (ohne .fortsetzung, .exec-, .aufwand-, .modell-)."
     } > "$body"
     # erst archivieren, dann Report veroeffentlichen (Importer sieht nie Report + Brief in eingang/)
     mv -f "$EIN/$name" "$ERL/${ts}_$name"
@@ -246,7 +257,9 @@ process() {
   fi
 
   local bin
-  if [ "$exec" = codex ]; then
+  if [ "$art" = RUN ]; then
+    bin="${FORGE_RUN_JOB_BIN:-$BINDIR/forge-run-job}"
+  elif [ "$exec" = codex ]; then
     bin="$CODEX_BIN"
     if [ -n "$fort" ]; then args=(exec resume); else args=(exec); fi
     args+=(--json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox)
@@ -271,7 +284,14 @@ process() {
     : > "$json"; printf '%s\n' "$skip" > "$err"
     printf '%s\n' "FEHLER: $skip" > "$body"
   else
-    ( forge_exec_env "$exec" "${ts}_$name" "${k%%-*}" "$k"; cd "$WORK" && exec timeout "${FORGE_MAX_SECONDS:-14400}" "$bin" "${args[@]}" < "$EIN/$name" > "$json" 2> "$err" 9>&- 8>&- ) &
+    if [ "$art" = RUN ]; then
+      # LLM-freier Auftrag: kein Executor-Environment (kein MCP-Token, kein OTEL), leeres Environment mit fester Liste; die Brief-Datei bleibt in eingang/ (W-3) und wird nur als Auftrag gelesen
+      local -a renv=(PATH=/usr/local/bin:/usr/bin:/bin HOME="${HOME:-/srv/forge/home}" LANG=C.UTF-8 FORGE_BASE="$BASE" FORGE_RUN_BODY="$body") rv
+      for rv in FORGE_GRAPH_DIR FORGE_RUN_REPOS_FILE FORGE_RUN_JOBS_DIR FORGE_RUN_GATES_FILE FORGE_RUN_WRITE_RESULT; do [ -n "${!rv:-}" ] && renv+=("$rv=${!rv}"); done
+      ( cd "$WORK" && exec timeout "${FORGE_RUN_MAX_SECONDS:-3900}" env -i "${renv[@]}" "$bin" "$EIN/$name" < /dev/null > "$json" 2> "$err" 9>&- 8>&- ) &
+    else
+      ( forge_exec_env "$exec" "${ts}_$name" "${k%%-*}" "$k"; cd "$WORK" && exec timeout "${FORGE_MAX_SECONDS:-14400}" "$bin" "${args[@]}" < "$EIN/$name" > "$json" 2> "$err" 9>&- 8>&- ) &
+    fi
     CHILD=$!
     unclaim      # Executor ist gestartet: Lock frei (forge-stop darf jetzt; der laufende Brief bleibt unberuehrt)
     hb_start
@@ -280,7 +300,9 @@ process() {
     while kill -0 "$CHILD" 2>/dev/null; do wait "$CHILD"; rc=$?; done
     CHILD=""
     hb_stop
-    if [ -s "$json" ]; then
+    if [ "$art" = RUN ]; then
+      :   # kein Session-/Kosten-/Usage-Parsing: der Body wurde von forge-run-job in $body geschrieben (oder fehlt => Fehlerblock unten)
+    elif [ -s "$json" ]; then
       if [ "$exec" = codex ]; then
         newsid=$(codex_parse "$json" thread)
         result=$(codex_parse "$json" text)
@@ -292,7 +314,9 @@ process() {
         [ -z "$cost" ] && cost=$(json_get "$json" cost_usd)
       fi
     fi
-    if [ -n "$result" ]; then
+    if [ "$art" = RUN ] && [ -s "$body" ]; then
+      :
+    elif [ -n "$result" ]; then
       printf '%s\n' "$result" > "$body"
     else
       {
@@ -321,7 +345,7 @@ process() {
     echo "Executor: $exec"
     [ "$rejected" = 1 ] && echo "- Status: ABGELEHNT (Executor passt nicht zur gespeicherten Session)"
     [ -n "$aufwand" ] && echo "- Aufwand: $aufwand"
-    echo "- Modell: ${model:-(Standard)}"
+    if [ "$art" = RUN ]; then echo "- Modell: -"; else echo "- Modell: ${model:-(Standard)}"; fi
     if [ -n "$fort" ]; then echo "- Fortsetzung: ja (resume ${sid:-?})"; else echo "- Fortsetzung: nein"; fi
     echo "- Session: ${newsid:-${sid:--}}"
     echo "- Start (UTC): $start"

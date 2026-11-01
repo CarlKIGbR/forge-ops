@@ -1,0 +1,7 @@
+{
+  "_comment": "Gate-Tabelle des RUN-Jobs ci-gate (ops-eigen, NICHT aus dem Branch). Schluessel: Repo-Name oder '*'. Gate -> {argv, timeout}. Fehlender Eintrag => not_configured => rot (fail closed). Welche Gates ein Profil verlangt, entscheidet der Graph (S3a); hier steht nur, WIE ein Gate ausgefuehrt wird.",
+  "forge-ops": {
+    "shell_syntax": {"argv": ["bash", "-c", "set -e; for f in bin/*.sh tests/*.sh bin/jobs/merge bin/jobs/lock-set bin/jobs/deploy-check bin/jobs/deploy-stage bin/jobs/acceptance; do bash -n \"$f\"; done"], "timeout": 120},
+    "tests": {"argv": ["bash", "tests/test_write_result.sh"], "timeout": 600}
+  }
+}

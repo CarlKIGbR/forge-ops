@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""RUN-Job ci-gate (F5c Teil 2, Design §3.3 "tests (mechanical gate)", Slice S2c). Kein Modell, kein Ermessen: fuehrt die benannten Gates fuer GENAU EINEN Head aus.
+
+    ci-gate <repo-pfad> <branch> <head> <gate,gate,...>      (Aufruf nur durch bin/forge-run-job, Argumente sind dort validiert; FORGE_JOB_OUT = Ausgabeverzeichnis)
+
+Ablauf (jeder Schritt liest den Zustand frisch, G28):
+  1. Spitze des Branches aus git lesen (`refs/heads/<branch>`); != <head> => Exit 3 (Vorbedingung, nichts wird ausgefuehrt) - das Gate gilt nur fuer die Spitze, die der Graph erwartet
+  2. sauberer, ausserhalb des Repos liegender Checkout GENAU dieses Commits (`git clone --shared` + `checkout --detach`; das Quell-Repo wird nicht veraendert); HEAD des Checkouts == <head>
+  3. je Gate der Befehl aus der Gate-Tabelle (FORGE_RUN_GATES_FILE, ops-eigen, NICHT aus dem Branch): Repo-Eintrag, sonst "*". Kein Eintrag => `not_configured` und damit NICHT gruen (fail closed)
+     Befehle laufen mit leerem Environment, eigener Prozessgruppe, Zeitlimit; ein Gate, das getrackte Dateien veraendert, ist rot (`tree_modified`) und der Checkout wird zurueckgesetzt
+  4. detail.json (Urteil `ok` = alle Gates gruen, Gate-Liste, Spitze am Anfang und am Ende) + report.txt + head_worktree (der Checkout: forge-run-job laesst den Head von forge-write-result aus git
+     uebernehmen - M-100, der Head im Ergebnis ist nie getippt)
+Exit 0 = Gates gelaufen (Urteil in detail.json), 3 = Vorbedingung verletzt. Gate-Tabelle: {"<repo>|*": {"<gate>": {"argv": [...], "timeout": <s>}}}."""
+import hashlib
+import json
+import os
+import re
+import resource
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+OPS = os.path.dirname(os.path.dirname(HERE))
+TAIL = 1500
+DEFAULT_TIMEOUT = 900
+MAX_GATE_OUTPUT = 8 * 1024 * 1024
+
+
+def git_env(extra=None):
+    e = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": os.environ.get("HOME", "/nonexistent"), "LANG": "C", "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+         "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
+    e.update(extra or {})
+    return e
+
+
+def git(cwd, *args, check=False):
+    r = subprocess.run(["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", cwd, *args], env=git_env(), stdin=subprocess.DEVNULL, capture_output=True, timeout=300, check=False)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"git {args[0]} fehlgeschlagen: {r.stderr.decode('utf-8', 'replace').strip()[:200]}")
+    return r
+
+
+def tip_of(repo, branch):
+    r = git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}")
+    v = r.stdout.decode().strip()
+    return v if r.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", v) else None
+
+
+def load_gates(repo_name):
+    path = os.environ.get("FORGE_RUN_GATES_FILE", os.path.join(OPS, "etc", "ci-gates.json"))
+    try:
+        with open(path, encoding="utf-8") as f:
+            table = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(table, dict):
+        return {}
+    merged = {}
+    for k in ("*", repo_name):
+        t = table.get(k)
+        if isinstance(t, dict):
+            merged.update({g: v for g, v in t.items() if isinstance(v, dict)})
+    return merged
+
+
+def limit():
+    resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_GATE_OUTPUT, MAX_GATE_OUTPUT))
+    os.setsid()
+
+
+def run_gate(name, spec, cwd, home, logpath):
+    argv = spec.get("argv")
+    if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+        return {"name": name, "status": "error", "reason": "bad_gate_table", "exit": None, "seconds": 0.0}
+    timeout = spec.get("timeout") if isinstance(spec.get("timeout"), int) and not isinstance(spec.get("timeout"), bool) and 1 <= spec["timeout"] <= 3600 else DEFAULT_TIMEOUT
+    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": home, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "CI": "1", "TMPDIR": os.path.join(home, "tmp")}
+    t0 = time.monotonic()
+    status, rc = "pass", None
+    try:
+        with open(logpath, "wb") as lf:
+            p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT, preexec_fn=limit, close_fds=True)
+            try:
+                rc = p.wait(timeout=timeout)
+                status = "pass" if rc == 0 else "fail"
+            except subprocess.TimeoutExpired:
+                status = "timeout"
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    try:
+                        os.killpg(p.pid, sig)
+                    except OSError:
+                        pass
+                    try:
+                        p.wait(timeout=10)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+    except OSError as e:
+        return {"name": name, "status": "error", "reason": f"cannot_start:{type(e).__name__}", "exit": None, "seconds": round(time.monotonic() - t0, 1)}
+    try:
+        with open(logpath, "rb") as lf:
+            data = lf.read()
+    except OSError:
+        data = b""
+    return {"name": name, "status": status, "exit": rc, "seconds": round(time.monotonic() - t0, 1), "output_sha256": hashlib.sha256(data).hexdigest(), "output_bytes": len(data),
+            "tail": data[-TAIL:].decode("utf-8", "replace")}
+
+
+def main(argv):
+    if len(argv) != 5:
+        print("ci-gate: Aufruf: ci-gate <repo-pfad> <branch> <head> <gate,gate,...>", file=sys.stderr)
+        return 2
+    repo, branch, head, gates = argv[1], argv[2], argv[3], [g for g in argv[4].split(",") if g]
+    out = os.environ["FORGE_JOB_OUT"]
+    scratch = os.path.dirname(out)
+
+    def finish(detail, ok, report, code=0):
+        detail["ok"] = ok
+        with open(os.path.join(out, "detail.json"), "w", encoding="utf-8") as f:
+            json.dump(detail, f, ensure_ascii=False)
+        with open(os.path.join(out, "report.txt"), "w", encoding="utf-8") as f:
+            f.write(report)
+        return code
+
+    base = {"repo": os.path.basename(repo), "branch": branch, "expected_head": head, "gates": []}
+    tip0 = tip_of(repo, branch)
+    if tip0 is None:
+        print(f"ci-gate: Branch {branch} existiert im Repo nicht")
+        return finish({**base, "reason": "branch_missing"}, False, f"Branch `{branch}` not found in repo `{base['repo']}`; nothing was run.\n", 3)
+    if tip0 != head:
+        print(f"ci-gate: Spitze von {branch} ist {tip0}, erwartet {head}")
+        return finish({**base, "reason": "head_mismatch", "tip": tip0}, False, f"Tip of `{branch}` is `{tip0}`, expected `{head}`; nothing was run.\n", 3)
+    checkout = os.path.join(scratch, "checkout")
+    home = os.path.join(scratch, "home")
+    os.makedirs(os.path.join(home, "tmp"), exist_ok=True)
+    try:
+        git(scratch, "clone", "-q", "--shared", "--no-checkout", "--", repo, checkout, check=True)
+        git(checkout, "checkout", "-q", "--detach", head, check=True)
+        got = git(checkout, "rev-parse", "HEAD").stdout.decode().strip()
+        if got != head:
+            raise RuntimeError(f"Checkout-HEAD {got} != {head}")
+    except Exception as e:                                       # Checkout nicht herstellbar: das ist ein Job-Fehler, kein Gate-Urteil
+        print(f"ci-gate: Checkout fehlgeschlagen: {e}")
+        return finish({**base, "reason": "checkout_failed", "error": str(e)[:200]}, False, f"Checkout of `{head}` failed: {str(e)[:200]}\n", 70)
+    open(os.path.join(out, "head_worktree"), "w").write(checkout)
+    table = load_gates(base["repo"])
+    results = []
+    gdir = os.path.join(scratch, "gatelogs")
+    os.makedirs(gdir, exist_ok=True)
+    for g in gates:
+        spec = table.get(g)
+        if spec is None:
+            r = {"name": g, "status": "not_configured", "exit": None, "seconds": 0.0}
+        else:
+            r = run_gate(g, spec, checkout, home, os.path.join(gdir, f"{g}.log"))
+            dirty = git(checkout, "status", "--porcelain=v1", "--untracked-files=no").stdout.strip()
+            if dirty:                                            # ein Gate darf getrackte Dateien nicht aendern: rot, Checkout zuruecksetzen
+                r["status"], r["reason"] = "tree_modified", "gate modified tracked files"
+                git(checkout, "reset", "-q", "--hard", head)
+        results.append(r)
+    git(checkout, "clean", "-q", "-fdx")                         # ungetrackte Gate-Artefakte weg (der Head-Worktree ist der saubere Checkout)
+    tip1 = tip_of(repo, branch)
+    green = all(r["status"] == "pass" for r in results)
+    detail = {**base, "tip_at_start": tip0, "tip_at_end": tip1, "gates": results, "all_green": green}
+    lines = [f"Gate run for `{base['repo']}` branch `{branch}` at `{head}` (branch tip at end: `{tip1}`)", "", "| gate | status | exit | seconds |", "|---|---|---|---|"]
+    lines += [f"| {r['name']} | {r['status']} | {r.get('exit')} | {r['seconds']} |" for r in results]
+    lines += ["", "All gates green." if green else "NOT green: " + ", ".join(f"{r['name']}={r['status']}" for r in results if r["status"] != "pass")]
+    for r in results:
+        if r["status"] not in ("pass", "not_configured") and r.get("tail"):
+            lines += ["", f"### {r['name']} output tail", "```", r["tail"].rstrip(), "```"]
+    for r in results:                                             # Rohausgabe nur als Hash/Laenge im Ergebnis; der Auszug steht im Report, nicht im Ergebnis
+        r.pop("tail", None)
+    print(f"ci-gate: {'gruen' if green else 'NICHT gruen'} ({', '.join(f'{r['name']}={r['status']}' for r in results)})")
+    return finish(detail, green, "\n".join(lines) + "\n")
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except SystemExit:
+        raise
+    except BaseException as e:
+        print(f"ci-gate: interner Fehler ({type(e).__name__}: {str(e)[:200]})", file=sys.stderr)
+        sys.exit(70)

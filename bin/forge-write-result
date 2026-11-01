@@ -1,30 +1,47 @@
 #!/usr/bin/env python3
-"""forge-write-result: schreibt die maschinenlesbare Ergebnisdatei einer Graph-Einheit atomar (F5c Teil 2, Design §4.4, M-94).
+"""forge-write-result: schreibt Ergebnisdatei (result.json) und Report (report.md) einer Graph-Einheit atomar (F5c Teil 2, Design §4.4, M-94; M-100 Head-Herkunft).
 
-    forge-write-result --nonce <8hex> <graph_run_id>/<key> <json-datei>
+    forge-write-result --nonce <8hex> [--worktree <dir>] [--report <datei>] [--exclusive] <graph_run_id>/<key> <json-datei>
+
+M-100 (Head-Herkunft): Der Head einer Einheit wird VOM WERKZEUG aus git uebernommen (`git rev-parse HEAD` im --worktree), nie vom Agenten getippt.
+  * Schemata mit Head-Feld: graph.build.v1 (`head_sha`, `branch`), graph.review.v1 (`reviewed_head`), graph.run.v1 (`head_sha`, optional). Fehlt das Feld in der JSON-Datei, traegt das Werkzeug es ein;
+    steht es drin, muss es GENAU git rev-parse HEAD entsprechen (sonst Exit 3 mit beiden Werten) - ein falsch getippter Head wird nie geschrieben.
+  * build/review VERLANGEN --worktree (sonst Exit 3: Head nicht aus git ermittelbar) und --report (die Report-Kopfzeile `Head: <sha>` wird erzeugt, nicht getippt).
+  * --worktree: Verzeichnis eines git-Worktrees; der getrackte Teil muss sauber sein (git status --untracked-files=no), d. h. der Head ist der ENDGUELTIGE Commit - sonst Exit 3
+    ("erst committen"). Ein Commit NACH diesem Aufruf wird erst bei der Aufnahme (forge_core.graph.ingest) erkannt: dort muss der Head noch die Spitze des Branches sein.
+  * --report <datei>: Rohtext des Reports. Das Werkzeug schreibt report.md = `Head: <sha>` + Leerzeile + Text. Beginnt der Text selbst mit einer `Head:`-Zeile, muss sie dem erzeugten Head
+    entsprechen (sonst Exit 3) und wird durch die erzeugte ersetzt. Ohne --worktree (judge/ops ohne Head) wird der Text unveraendert als report.md geschrieben.
+  * --exclusive: bestehende Zieldateien werden nicht ersetzt (Exit 3) - fuer RUN-Jobs (genau ein Schreibvorgang je Einheit).
+Reihenfolge der Dateien: erst report.md, dann result.json (die Ergebnisdatei ist der Abschlussmarker); alles wird VOR dem ersten Schreiben geprueft.
 
 Prueft MINIMAL (damit der Agent Fehler sofort sieht): Groesse <= 256 KB, striktes JSON (Objekt, keine doppelten Schluessel, kein NaN/Infinity), bekanntes `schema` (graph.<rolle>.v1),
 Pflicht- und erlaubte Schluessel dieses Schemas, `nonce` == --nonce, `graph_run_id`/`key` == Pfadangabe. Die inhaltliche Pruefung (Typen, Laengen, Querregeln) und alle Identitaetspruefungen
-gegen den Ledger macht der Graph bei der Aufnahme (forge_core.graph.ingest) - dieses Werkzeug ersetzt sie nicht.
-Schreibt <FORGE_GRAPH_DIR>/<gid>/<key>/result.json: .tmp (O_EXCL) -> fsync -> rename -> fsync(dir). Das Verzeichnis legt der Graph an (vor der Veroeffentlichung); fehlt es oder ist es ein Symlink: Fehler.
-Exit 0 = geschrieben (stdout: "ok <pfad> <sha256>"), 2 = Aufruf, 3 = Datei ungueltig (genau eine Zeile "forge-write-result: <Grund>" auf stderr).
+gegen den Ledger sowie der Abgleich von Head/Report-Kopf mit der Branch-Spitze macht der Graph bei der Aufnahme - dieses Werkzeug ersetzt sie nicht.
+Schreibt <FORGE_GRAPH_DIR>/<gid>/<key>/{report.md,result.json}: .tmp (O_EXCL) -> fsync -> rename -> fsync(dir). Das Verzeichnis legt der Graph an (vor der Veroeffentlichung); fehlt es oder ist es ein Symlink: Fehler.
+Exit 0 = geschrieben (stdout: "ok <pfad> <sha256>" je Datei, dann ggf. "head <sha>"), 2 = Aufruf, 3 = ungueltig (genau eine Zeile "forge-write-result: <Grund>" auf stderr).
 FORGE_GRAPH_DIR (Standard /srv/forge/post/graph) ist nur fuer Tests ueberschreibbar."""
 import hashlib
 import json
 import os
 import re
 import stat
+import subprocess
 import sys
 
 MAX_BYTES = 256 * 1024
+MAX_REPORT = 262144
 ENVELOPE = ("schema", "nonce", "graph_run_id", "key")
 # Schluesseltabelle je Schema: (Pflicht, optional). Muss mit forge_core.graph.results.SPEC uebereinstimmen (Paritaetstest: forge-core tests/test_f5c2_s2b_write_result.py).
 SCHEMAS = {
     "graph.build.v1": (("head_sha", "branch", "files_changed", "self_check"), ("notes", "reserved_hits", "finding_responses")),
     "graph.review.v1": (("verdict", "reviewed_head", "findings"), ("notes",)),
     "graph.judge.v1": (("recommend", "rulings", "rationale"), ("notes",)),
-    "graph.run.v1": (("job", "ok"), ("script_sha256", "started_at", "ended_at", "detail", "notes")),
+    "graph.run.v1": (("job", "ok"), ("head_sha", "script_sha256", "started_at", "ended_at", "detail", "notes")),
 }
+# M-100: Schema -> Feld, das aus git kommt; HEAD_REQUIRED = Schemata, fuer die --worktree und --report Pflicht sind.
+HEAD_FIELD = {"graph.build.v1": "head_sha", "graph.review.v1": "reviewed_head", "graph.run.v1": "head_sha"}
+HEAD_REQUIRED = ("graph.build.v1", "graph.review.v1")
+BRANCH_FIELD = {"graph.build.v1": "branch"}
 
 
 # Grobe Typen der Top-Level-Felder (str/int/bool/list/dict/None=beliebig); Tiefenpruefung macht der Graph. Paritaet mit results.SPEC: Schluessel (Test), Typen hier zusaetzlich.
@@ -35,6 +52,8 @@ TYPES = {
     "verdict": STR, "reviewed_head": STR, "findings": LIST, "recommend": STR, "rulings": LIST, "rationale": STR,
     "job": STR, "ok": BOOL, "script_sha256": STR, "started_at": STR, "ended_at": STR, "detail": ANY,
 }
+USAGE = "Aufruf: forge-write-result --nonce <8hex> [--worktree <dir>] [--report <datei>] [--exclusive] <graph_run_id>/<key> <json-datei>"
+GIT_TIMEOUT = 30
 
 
 def fail(code: int, msg: str):
@@ -55,28 +74,146 @@ def bad_const(name):
     raise ValueError(f"{name} ist kein gueltiges JSON")
 
 
+def read_regular(path: str, limit: int, what: str) -> bytes:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as e:
+        fail(3, f"{what} nicht lesbar: {e.strerror}")
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            fail(3, f"{what} ist keine regulaere Datei")
+        data = f.read(limit + 1)
+    if len(data) > limit:
+        fail(3, f"{what} groesser als {limit // 1024} KB")
+    return data
+
+
+def git(worktree: str, *args: str) -> subprocess.CompletedProcess:
+    """git mit gehaertetem Environment (keine globale/System-Konfiguration, kein fsmonitor, keine Rueckfrage, keine Index-Locks)."""
+    env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "LANG": "C", "LC_ALL": "C", "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+           "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
+    try:
+        return subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", worktree, *args], env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=GIT_TIMEOUT, check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        fail(3, f"git nicht ausfuehrbar ({type(e).__name__})")
+
+
+def capture_head(worktree: str, want_branch: bool) -> tuple[str, str | None]:
+    """(head, branch) aus git: `rev-parse HEAD` des Worktrees NACH dem letzten Commit. Der getrackte Teil muss sauber sein. branch = None bei losgeloestem HEAD (nur erlaubt, wenn want_branch False)."""
+    try:
+        if not stat.S_ISDIR(os.stat(worktree).st_mode):
+            fail(3, f"--worktree ist kein Verzeichnis: {worktree[:80]}")
+    except OSError as e:
+        fail(3, f"--worktree nicht lesbar: {e.strerror}")
+    r = git(worktree, "rev-parse", "--is-inside-work-tree")
+    if r.returncode != 0 or r.stdout.strip() != b"true":
+        fail(3, "--worktree ist kein git-Worktree")
+    r = git(worktree, "rev-parse", "--verify", "-q", "HEAD^{commit}")
+    head = r.stdout.decode("ascii", "replace").strip()
+    if r.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", head):
+        fail(3, "git rev-parse HEAD liefert keinen Commit (noch kein Commit im Worktree?)")
+    r = git(worktree, "status", "--porcelain=v1", "--untracked-files=no")
+    if r.returncode != 0:
+        fail(3, "git status fehlgeschlagen")
+    if r.stdout.strip():
+        fail(3, "der Worktree hat nicht committete Aenderungen an getrackten Dateien: der Head ist nur der ENDGUELTIGE Commit - erst committen, dann forge-write-result aufrufen")
+    r = git(worktree, "symbolic-ref", "-q", "--short", "HEAD")
+    branch = r.stdout.decode("utf-8", "replace").strip() if r.returncode == 0 else None
+    if want_branch and not branch:
+        fail(3, "HEAD des Worktrees ist losgeloest (detached): auf dem Branch der Einheit arbeiten und dort committen")
+    return head, branch
+
+
+def compose_report(body: bytes, head: str | None) -> bytes:
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        fail(3, "report-Datei ist kein UTF-8")
+    if "\x00" in text:
+        fail(3, "report-Datei enthaelt NUL")
+    if not text.strip():
+        fail(3, "report-Datei ist leer")
+    if head is None:
+        out = text
+    else:
+        first, _, rest = text.lstrip("\n").partition("\n")
+        m = re.fullmatch(r"\s*Head:\s*(\S*)\s*", first)
+        if m:                                                      # selbst getippte Kopfzeile: nur gueltig, wenn sie dem erzeugten Head entspricht; ersetzt durch die erzeugte
+            if m.group(1) != head:
+                fail(3, f"die getippte Report-Zeile 'Head: {m.group(1)[:50]}' weicht von git rev-parse HEAD ({head}) ab - den Head nicht tippen, das Werkzeug erzeugt die Kopfzeile")
+            text = rest
+        out = f"Head: {head}\n\n{text.lstrip(chr(10))}"
+    data = out.encode("utf-8")
+    if len(data) > MAX_REPORT:
+        fail(3, f"report.md waere groesser als {MAX_REPORT // 1024} KB")
+    return data
+
+
+def write_atomic(d: str, name: str, data: bytes, exclusive: bool) -> str:
+    final, tmp = os.path.join(d, name), os.path.join(d, f".{name}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o664)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o664)
+        if exclusive:
+            os.link(tmp, final)                                  # scheitert, wenn final existiert (kein Ersetzen)
+            os.unlink(tmp)
+        else:
+            os.rename(tmp, final)
+    except FileExistsError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        fail(3, f"{name} existiert bereits (--exclusive)")
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        fail(3, f"schreiben fehlgeschlagen: {e.strerror}")
+    return final
+
+
+def parse_args(args: list[str]) -> dict:
+    opts = {"nonce": None, "worktree": None, "report": None, "exclusive": False}
+    pos: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--nonce", "--worktree", "--report"):
+            if i + 1 >= len(args) or opts[a[2:]] is not None:
+                fail(2, USAGE)
+            opts[a[2:]] = args[i + 1]
+            i += 2
+        elif a == "--exclusive":
+            opts["exclusive"] = True
+            i += 1
+        elif a.startswith("--"):
+            fail(2, USAGE)
+        else:
+            pos.append(a)
+            i += 1
+    if opts["nonce"] is None or len(pos) != 2:
+        fail(2, USAGE)
+    opts["pathkey"], opts["src"] = pos
+    return opts
+
+
 def main(argv):
-    args = argv[1:]
-    if len(args) != 4 or args[0] != "--nonce":
-        fail(2, "Aufruf: forge-write-result --nonce <8hex> <graph_run_id>/<key> <json-datei>")
-    nonce, pathkey, src = args[1], args[2], args[3]
+    o = parse_args(argv[1:])
+    nonce, pathkey, src = o["nonce"], o["pathkey"], o["src"]
     if not re.fullmatch(r"[0-9a-f]{8}", nonce):
         fail(2, "--nonce muss 8 Hex-Zeichen sein")
     m = re.fullmatch(r"([1-9][0-9]{0,17})/([a-z0-9][a-z0-9_.:-]{0,79})", pathkey)
     if not m or ".." in pathkey:
         fail(2, "Pfadangabe muss <graph_run_id>/<key> sein (Key: [a-z0-9_.:-], kein '..')")
     gid, key = int(m.group(1)), m.group(2)
-    try:
-        fd = os.open(src, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
-    except OSError as e:
-        fail(3, f"JSON-Datei nicht lesbar: {e.strerror}")
-    with os.fdopen(fd, "rb") as f:
-        st = os.fstat(f.fileno())
-        if not stat.S_ISREG(st.st_mode):
-            fail(3, "JSON-Datei ist keine regulaere Datei")
-        data = f.read(MAX_BYTES + 1)
-    if len(data) > MAX_BYTES:
-        fail(3, f"JSON-Datei groesser als {MAX_BYTES // 1024} KB")
+    data = read_regular(src, MAX_BYTES, "JSON-Datei")
     try:
         obj = json.loads(data.decode("utf-8"), object_pairs_hook=no_dup, parse_constant=bad_const)
     except (ValueError, RecursionError) as e:
@@ -90,6 +227,30 @@ def main(argv):
     schema = obj.get("schema")
     if schema not in SCHEMAS:
         fail(3, f"unbekanntes schema {str(schema)[:40]!r} (erlaubt: {', '.join(sorted(SCHEMAS))})")
+    # ---- M-100: Head und Branch aus git, nie getippt ----
+    head = None
+    hfield = HEAD_FIELD.get(schema)
+    if hfield and o["worktree"] is None and schema in HEAD_REQUIRED:
+        fail(3, f"{schema}: der Head wird aus git uebernommen, nicht getippt - bitte --worktree <dein-git-worktree> angeben (nach dem letzten Commit)")
+    if o["worktree"] is not None and not hfield:
+        fail(3, f"{schema} hat kein Head-Feld: --worktree nicht erlaubt")
+    changed = False
+    if o["worktree"] is not None:
+        head, branch = capture_head(o["worktree"], want_branch=schema in BRANCH_FIELD)
+        if hfield in obj and obj[hfield] != head:
+            fail(3, f"{hfield} in der Datei ({str(obj[hfield])[:50]}) weicht von git rev-parse HEAD ({head}) ab - den Head nicht tippen, das Werkzeug uebernimmt ihn aus git (Feld weglassen)")
+        if hfield not in obj:
+            obj[hfield] = head
+            changed = True
+        bf = BRANCH_FIELD.get(schema)
+        if bf:
+            if bf in obj and obj[bf] != branch:
+                fail(3, f"{bf} in der Datei ({str(obj[bf])[:50]}) weicht vom Branch des Worktrees ({branch}) ab")
+            if bf not in obj:
+                obj[bf] = branch
+                changed = True
+    if o["report"] is None and schema in HEAD_REQUIRED:
+        fail(3, f"{schema}: --report <datei> ist Pflicht (die Kopfzeile 'Head: <sha>' des Reports wird vom Werkzeug erzeugt)")
     required, optional = SCHEMAS[schema]
     missing = [k for k in ENVELOPE + required if k not in obj]
     if missing:
@@ -103,6 +264,11 @@ def main(argv):
         fail(3, f"graph_run_id muss {gid} sein")
     if obj["key"] != key:
         fail(3, f"key muss {key!r} sein")
+    report = compose_report(read_regular(o["report"], MAX_REPORT, "report-Datei"), head) if o["report"] is not None else None
+    if changed:
+        data = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(data) > MAX_BYTES:
+            fail(3, f"JSON-Datei groesser als {MAX_BYTES // 1024} KB")
     root = os.environ.get("FORGE_GRAPH_DIR", "/srv/forge/post/graph")
     for p in (os.path.join(root, str(gid)), os.path.join(root, str(gid), key)):
         try:
@@ -111,27 +277,22 @@ def main(argv):
         except FileNotFoundError:
             fail(3, f"Einheiten-Verzeichnis fehlt (legt der Graph vor der Veroeffentlichung an): {p}")
     d = os.path.join(root, str(gid), key)
-    final, tmp = os.path.join(d, "result.json"), os.path.join(d, f".result.json.{os.getpid()}.tmp")
-    try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o664)
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(tmp, 0o664)
-        os.rename(tmp, final)
-    except OSError as e:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        fail(3, f"schreiben fehlgeschlagen: {e.strerror}")
+    if o["exclusive"]:                                          # vor dem ersten Schreiben: kein halber Zustand (report.md ohne result.json) bei einem Treffer
+        for name in ("report.md", "result.json"):
+            if os.path.lexists(os.path.join(d, name)):
+                fail(3, f"{name} existiert bereits (--exclusive)")
+    out = []
+    if report is not None:
+        out.append(f"ok {write_atomic(d, 'report.md', report, o['exclusive'])} {hashlib.sha256(report).hexdigest()}")
+    out.append(f"ok {write_atomic(d, 'result.json', data, o['exclusive'])} {hashlib.sha256(data).hexdigest()}")
     dfd = os.open(d, os.O_RDONLY)
     try:
         os.fsync(dfd)
     finally:
         os.close(dfd)
-    print(f"ok {final} {hashlib.sha256(data).hexdigest()}")
+    if head:
+        out.append(f"head {head}")
+    print("\n".join(out))
 
 
 if __name__ == "__main__":

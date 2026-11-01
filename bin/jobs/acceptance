@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# RUN-Job "acceptance": Stub (F5c Teil 2, Slice S2c; Design §11: der echte Job folgt in S5b1/S5b2, Seam `seam_run_jobs`). Antwortet mit Exit 64 und schreibt nichts.
+# Aufruf nur durch bin/forge-run-job (validierte Argumente); eine Ausfuehrung dieses Stubs hat keine Wirkung.
+printf '{"ok":false,"reason":"not_implemented","job":"acceptance","seam":"seam_run_jobs"}\n' > "${FORGE_JOB_OUT:-/dev/null}/detail.json" 2>/dev/null
+echo "acceptance: not implemented (seam_run_jobs)"
+exit 64

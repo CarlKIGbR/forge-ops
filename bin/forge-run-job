@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""forge-run-job: fuehrt EINEN LLM-freien Auftrag (RUN-Brief) aus (F5c Teil 2, Design §4.6, Slice S2c). Vom Watcher fuer `RUN_<K>[.n-<8hex>].md` aufgerufen:
+
+    forge-run-job <spec-datei>        (die Brief-Datei in eingang/; Inhalt = JSON-Auftrag, kein Markdown)
+
+DER eine Weg (G27): kein Job laeuft ausser ueber diese Datei. Reihenfolge der Waechter, fail closed - jede Ablehnung ist Exit 65 mit genau einer Zeile auf stderr, es wurde nichts ausgefuehrt:
+  1. Spec-Datei: regulaere Datei, <= 64 KB, striktes JSON (Objekt, keine doppelten Schluessel, kein NaN), genau die Schluessel job/args/graph_run_id/key/nonce (+ lock_token nur fuer Jobs mit Lock);
+     JEDER Wert wird auf seinen Typ geprueft, bevor er nachgeschlagen oder verglichen wird (kein Absturz durch Listen/Objekte)
+  2. `job` steht in der festen Allowlist JOBS; `args` hat GENAU die Schluessel des Jobs, jeder Wert passt zu seiner Regex/Aufzaehlung (40-Hex-Shas, Repo-Name aus der Repo-Liste, Branch-Muster,
+     ganzzahlige Deployment-ID, feste Gate-/Stage-Namen); `lock_token` ist fuer Jobs mit Lock Pflicht, sonst verboten
+  3. Einheiten-Verzeichnis <FORGE_GRAPH_DIR>/<graph_run_id>/<key> existiert als Verzeichnis (kein Symlink) und enthaelt noch weder result.json noch report.md (Exit 66)
+  4. Der Job `bin/jobs/<job>` (Datei aus dem festen Verzeichnis, kein Pfad aus dem Auftrag) laeuft mit leerem Environment, eigener Prozessgruppe und Zeitlimit; Ausgabe wird in eine Datei geleitet
+  5. result.json (graph.run.v1) und report.md schreibt NUR forge-write-result (Schema, Nonce, Identitaet, atomar, --exclusive); der Head (M-100) kommt dabei aus git (--worktree, vom Job benannt),
+     nie aus dem Auftrag oder der Job-Ausgabe
+Exit-Codes: 0 Job ausgefuehrt und Ergebnis geschrieben (das URTEIL steht in result.json `ok`, nicht im Exit-Code); 3 Vorbedingung nicht erfuellt (Job: z. B. Head != Branch-Spitze);
+4 needs_rebase (Job merge); 64 Job nicht implementiert (Stub); 65 Auftrag abgelehnt; 66 Einheiten-Verzeichnis fehlt/unsicher/Ergebnis liegt schon vor; 70 interner Fehler bzw. Ergebnis nicht schreibbar;
+124 Zeitlimit des Jobs. Jeder andere Job-Exit-Code wird durchgereicht (1..255). Fuer 3/4/64/124 und sonstige Job-Fehler wird ein Ergebnis mit ok=false geschrieben (Beleg), fuer 65/66 nicht.
+stdout = JSON-Zeilen-Log (`{"type":"run-job.finished",...}`, wird zum Run-Log des Watchers); FORGE_RUN_BODY (vom Watcher gesetzt) bekommt den Report-Text (Job + Ausgabe-Ende <= 3000 Bytes).
+Environment (nur Tests ueberschreiben): FORGE_BASE (/srv/forge), FORGE_GRAPH_DIR, FORGE_RUN_REPOS_FILE (Repo-Liste), FORGE_RUN_JOBS_DIR, FORGE_RUN_GATES_FILE, FORGE_RUN_WRITE_RESULT."""
+import hashlib
+import json
+import os
+import re
+import resource
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+OPS = os.path.dirname(HERE)
+MAX_SPEC = 64 * 1024
+BODY_TAIL = 3000
+MAX_DETAIL = 128 * 1024
+MAX_REPORT_TEXT = 100 * 1024
+MAX_JOB_OUTPUT = 16 * 1024 * 1024
+
+# ---- Regeln je Wert -------------------------------------------------------------------------------------------------------------------------------
+SHA40 = re.compile(r"[0-9a-f]{40}")
+REPO = re.compile(r"[a-z0-9][a-z0-9_.-]{0,40}")
+BRANCH = re.compile(r"[a-z0-9][a-z0-9/_.-]{0,80}")
+NONCE = re.compile(r"[0-9a-f]{8}")
+KEY = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,79}")
+LOCK_TOKEN = re.compile(r"[A-Za-z0-9._-]{16,128}")
+GATE_NAMES = ("lint", "format", "gitleaks", "tests", "diff_coverage", "migration_class", "shell_syntax")
+STAGES = ("prepare", "migrate", "switch", "verify", "rollback")
+LOCK_ACTIONS = ("acquire", "release", "status")
+
+
+class Bad(Exception):
+    pass
+
+
+def v_sha(v):
+    if not isinstance(v, str) or not SHA40.fullmatch(v):
+        raise Bad("erwartet 40 Hex-Zeichen (git sha)")
+
+
+def v_repo(v):
+    if not isinstance(v, str) or not REPO.fullmatch(v) or ".." in v:
+        raise Bad("Repo-Name ungueltig")
+
+
+def v_branch(v):
+    if not isinstance(v, str) or not BRANCH.fullmatch(v) or ".." in v or "//" in v or v.endswith(("/", ".", ".lock")) or "/." in v:
+        raise Bad("Branch-Name ungueltig")
+
+
+def v_int(v):
+    if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 2**53:
+        raise Bad("ganze Zahl >= 1 erwartet")
+
+
+def v_gates(v):
+    if not isinstance(v, list) or not 1 <= len(v) <= len(GATE_NAMES):
+        raise Bad("Liste von 1..%d Gate-Namen erwartet" % len(GATE_NAMES))
+    for g in v:
+        if not isinstance(g, str) or g not in GATE_NAMES:
+            raise Bad("unbekanntes Gate (erlaubt: %s)" % ", ".join(GATE_NAMES))
+    if len(set(v)) != len(v):
+        raise Bad("Gate doppelt")
+
+
+def enum(*vals):
+    def check(v):
+        if not isinstance(v, str) or v not in vals:
+            raise Bad("erlaubt: " + ", ".join(vals))
+    return check
+
+
+# Feste Allowlist. args: Schluessel -> Pruefung, Reihenfolge = Reihenfolge der Positionsargumente des Jobs (repo wird als absoluter Pfad uebergeben, gates als kommagetrennte Liste).
+JOBS = {
+    "ci-gate": {"args": {"repo": v_repo, "branch": v_branch, "head": v_sha, "gates": v_gates}, "lock": False, "timeout": 3600},
+    "merge": {"args": {"repo": v_repo, "branch": v_branch, "expected_head": v_sha, "base": v_branch}, "lock": True, "timeout": 900},
+    "lock-set": {"args": {"repo": v_repo, "action": enum(*LOCK_ACTIONS)}, "lock": True, "timeout": 120},
+    "deploy-check": {"args": {"repo": v_repo, "deployment_id": v_int}, "lock": False, "timeout": 600},
+    "deploy-stage": {"args": {"repo": v_repo, "deployment_id": v_int, "stage": enum(*STAGES)}, "lock": True, "timeout": 3600},
+    "acceptance": {"args": {"repo": v_repo, "deployment_id": v_int}, "lock": False, "timeout": 1800},
+}
+TOP = ("job", "args", "graph_run_id", "key", "nonce", "lock_token")
+
+
+def utcl() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def reject(code: int, msg: str, started: str | None = None):
+    """Eine Zeile auf stderr, eine JSON-Zeile auf stdout (Run-Log), Report-Text in FORGE_RUN_BODY; nichts wurde ausgefuehrt."""
+    sys.stderr.write(f"forge-run-job: {msg}\n")
+    log({"type": "run-job.finished", "exit": code, "result": "not_written", "reason": msg[:200]})
+    body = os.environ.get("FORGE_RUN_BODY")
+    if body:
+        try:
+            with open(body, "w", encoding="utf-8") as f:
+                f.write(f"RUN abgelehnt (Exit {code}): {msg}\nEs wurde nichts ausgefuehrt.\n")
+        except OSError:
+            pass
+    sys.exit(code)
+
+
+def log(obj: dict) -> None:
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def no_dup(pairs):
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError("doppelter Schluessel")
+        d[k] = v
+    return d
+
+
+def bad_const(name):
+    raise ValueError("%s ist kein gueltiges JSON" % name)
+
+
+def load_repos() -> set[str]:
+    path = os.environ.get("FORGE_RUN_REPOS_FILE", os.path.join(OPS, "etc", "run-repos.list"))
+    try:
+        with open(path, encoding="utf-8") as f:
+            return {ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith("#")}
+    except OSError:
+        return set()                                              # fail closed: ohne Liste ist kein Repo erlaubt
+
+
+def parse_spec(path: str) -> dict:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as e:
+        reject(65, f"Auftrag nicht lesbar: {e.strerror}")
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            reject(65, "Auftrag ist keine regulaere Datei")
+        data = f.read(MAX_SPEC + 1)
+    if len(data) > MAX_SPEC:
+        reject(65, "Auftrag groesser als 64 KB")
+    try:
+        spec = json.loads(data.decode("utf-8"), object_pairs_hook=no_dup, parse_constant=bad_const)
+    except (ValueError, RecursionError):
+        reject(65, "Auftrag ist kein gueltiges JSON-Objekt (strikt: keine doppelten Schluessel, kein NaN)")
+    if not isinstance(spec, dict):
+        reject(65, "Auftrag muss ein JSON-Objekt sein")
+    for k, want in (("job", str), ("args", dict), ("graph_run_id", int), ("key", str), ("nonce", str), ("lock_token", str)):   # Typen VOR jedem Nachschlagen
+        if k in spec and (not isinstance(spec[k], want) or (want is int and isinstance(spec[k], bool))):
+            reject(65, f"Feld {k!r} hat den falschen Typ ({type(spec[k]).__name__})")
+    unknown = [k for k in spec if k not in TOP]
+    if unknown:
+        reject(65, "unbekannte Schluessel im Auftrag: " + ", ".join(sorted(str(u)[:30] for u in unknown)[:5]))
+    missing = [k for k in TOP[:5] if k not in spec]
+    if missing:
+        reject(65, "Pflichtschluessel fehlen: " + ", ".join(missing))
+    job = JOBS.get(spec["job"])
+    if job is None:
+        reject(65, f"Job {spec['job'][:40]!r} steht nicht in der Allowlist ({', '.join(sorted(JOBS))})")
+    if spec["graph_run_id"] < 1 or spec["graph_run_id"] > 2**53:
+        reject(65, "graph_run_id ausserhalb des Bereichs")
+    if not KEY.fullmatch(spec["key"]) or ".." in spec["key"]:
+        reject(65, "key ungueltig")
+    if not NONCE.fullmatch(spec["nonce"]):
+        reject(65, "nonce muss 8 Hex-Zeichen sein")
+    args = spec["args"]
+    want_keys = list(job["args"])
+    if sorted(args) != sorted(want_keys):
+        reject(65, f"args fuer {spec['job']}: erwartet genau {', '.join(want_keys)}")
+    for k, check in job["args"].items():
+        try:
+            check(args[k])
+        except Bad as e:
+            reject(65, f"args.{k}: {e}")
+    if job["lock"]:
+        if "lock_token" not in spec:
+            reject(65, f"Job {spec['job']} verlangt lock_token")
+        if not LOCK_TOKEN.fullmatch(spec["lock_token"]):
+            reject(65, "lock_token ungueltig")
+    elif "lock_token" in spec:
+        reject(65, f"Job {spec['job']} nimmt kein lock_token")
+    repos = load_repos()
+    if args["repo"] not in repos:
+        reject(65, f"Repo {args['repo']!r} steht nicht in der Repo-Liste")
+    return spec
+
+
+def unit_dir(spec: dict) -> str:
+    root = os.environ.get("FORGE_GRAPH_DIR") or os.path.join(os.environ.get("FORGE_BASE", "/srv/forge"), "post", "graph")
+    gid, key = str(spec["graph_run_id"]), spec["key"]
+    for p in (os.path.join(root, gid), os.path.join(root, gid, key)):
+        try:
+            st = os.lstat(p)
+        except OSError:
+            reject(66, f"Einheiten-Verzeichnis fehlt (legt der Graph vor der Veroeffentlichung an): {p}")
+        if not stat.S_ISDIR(st.st_mode):
+            reject(66, f"Einheiten-Verzeichnis ist kein Verzeichnis (Symlink?): {p}")
+    d = os.path.join(root, gid, key)
+    for name in ("result.json", "report.md"):
+        if os.path.lexists(os.path.join(d, name)):
+            reject(66, f"{name} liegt in der Einheit schon vor: ein RUN-Auftrag schreibt nie ueber ein vorhandenes Ergebnis")
+    return root
+
+
+def tail_of(path: str, n: int) -> str:
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - n))
+            return f.read(n).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def read_small(path: str, limit: int) -> bytes | None:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            return None
+        return f.read(limit)
+
+
+CURRENT: list = []                                                # laufender Job (Prozess); fuer das Aufraeumen bei SIGTERM/SIGINT des Watchers (Zeitlimit FORGE_RUN_MAX_SECONDS)
+
+
+def kill_current() -> None:
+    for p in CURRENT:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(p.pid, sig)
+            except OSError:
+                pass
+            try:
+                p.wait(timeout=5)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+
+
+def on_term(signum, frame):
+    kill_current()
+    sys.exit(124 if signum == signal.SIGTERM else 130)
+
+
+def limit_output():
+    resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_JOB_OUTPUT, MAX_JOB_OUTPUT))
+    os.setsid()
+
+
+def run_job(spec: dict, scratch: str) -> tuple[int, str, float, str]:
+    """(exit, Pfad der Ausgabedatei, Dauer, sha256 des Job-Skripts). Der Job liegt IMMER im festen Verzeichnis (kein Pfad aus dem Auftrag)."""
+    name = spec["job"]
+    jobs_dir = os.environ.get("FORGE_RUN_JOBS_DIR", os.path.join(HERE, "jobs"))
+    script = os.path.join(jobs_dir, name)
+    try:
+        st = os.lstat(script)
+        if not stat.S_ISREG(st.st_mode) or not os.access(script, os.X_OK):
+            raise OSError("kein ausfuehrbares Skript")
+        with open(script, "rb") as f:
+            sha = hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        reject(70, f"Job-Skript fehlt oder ist nicht ausfuehrbar: {name}")
+    args = spec["args"]
+    argv = [script]
+    for k in JOBS[name]["args"]:
+        v = args[k]
+        if k == "repo":
+            v = os.path.join(os.environ.get("FORGE_BASE", "/srv/forge"), "work", v)
+        elif k == "gates":
+            v = ",".join(v)
+        argv.append(str(v))
+    if JOBS[name]["lock"]:
+        argv += ["--lock-token", spec["lock_token"]]
+    out = os.path.join(scratch, "out")
+    os.makedirs(out, mode=0o700)
+    os.makedirs(os.path.join(scratch, "home"), mode=0o700)
+    os.makedirs(os.path.join(scratch, "tmp"), mode=0o700)
+    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": os.path.join(scratch, "home"), "TMPDIR": os.path.join(scratch, "tmp"), "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "FORGE_JOB_OUT": out,
+           "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"}
+    for k in ("FORGE_RUN_GATES_FILE", "FORGE_BASE"):
+        if os.environ.get(k):
+            env[k] = os.environ[k]
+    outfile = os.path.join(scratch, "job.out")
+    t0 = time.monotonic()
+    with open(outfile, "wb") as of:
+        p = subprocess.Popen(argv, cwd=scratch, env=env, stdin=subprocess.DEVNULL, stdout=of, stderr=subprocess.STDOUT, preexec_fn=limit_output, close_fds=True)
+        CURRENT.append(p)
+        try:
+            rc = p.wait(timeout=JOBS[name]["timeout"])
+        except subprocess.TimeoutExpired:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(p.pid, sig)
+                except OSError:
+                    pass
+                try:
+                    p.wait(timeout=10)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            rc = 124
+        finally:
+            CURRENT.clear()
+    if rc < 0:
+        rc = 128 + (-rc)
+    return rc, outfile, time.monotonic() - t0, sha
+
+
+def main(argv: list[str]) -> None:
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    if len(argv) != 2:
+        reject(65, "Aufruf: forge-run-job <spec-datei>")
+    spec = parse_spec(argv[1])
+    root = unit_dir(spec)
+    started = utcl()
+    scratch = tempfile.mkdtemp(prefix="forge-run-job.")
+    try:
+        os.chmod(scratch, 0o700)
+        rc, outfile, dur, sha = run_job(spec, scratch)
+        ended = utcl()
+        out = os.path.join(scratch, "out")
+        raw = read_small(os.path.join(out, "detail.json"), MAX_DETAIL)
+        detail: dict = {}
+        if raw is not None:
+            try:
+                d = json.loads(raw.decode("utf-8"), object_pairs_hook=no_dup, parse_constant=bad_const)
+                detail = d if isinstance(d, dict) else {"job_detail": d}
+            except (ValueError, RecursionError):
+                detail = {"error": "detail.json des Jobs ist kein gueltiges JSON"}
+        verdict = detail.pop("ok", None)
+        ok = rc == 0 and verdict is True
+        if rc == 0 and verdict is not True and verdict is not False:
+            detail["error"] = "der Job meldete kein ok-Urteil (detail.json ok fehlt)"
+        detail["exit"] = rc
+        detail["duration_s"] = round(dur, 1)
+        rtxt = read_small(os.path.join(out, "report.txt"), MAX_REPORT_TEXT)
+        tail = tail_of(outfile, BODY_TAIL)
+        text = "\n".join([
+            f"# RUN {spec['job']} (graph run {spec['graph_run_id']}, unit {spec['key']})", "",
+            f"- ok: {str(ok).lower()}", f"- job exit code: {rc}", f"- started (UTC): {started}", f"- ended (UTC): {ended}", f"- script sha256: {sha}", "",
+            (rtxt or b"").decode("utf-8", "replace").strip() or "(no job report text)", "", "## Output tail", "```", tail.rstrip(), "```", ""])
+        body = os.environ.get("FORGE_RUN_BODY")
+        if body:                                                  # Watcher-Report: Kopf + gekuerzter Job-Text + Ausgabe-Ende (das volle report.md liegt in der Einheit)
+            short = (rtxt or b"").decode("utf-8", "replace").strip()[:4000] or "(no job report text)"
+            try:
+                with open(body, "w", encoding="utf-8") as f:
+                    f.write(text.replace((rtxt or b"").decode("utf-8", "replace").strip() or "(no job report text)", short, 1))
+            except OSError:
+                pass
+        # Ergebnis NUR ueber forge-write-result (G27: ein Schreibweg; M-100: der Head kommt aus git - --worktree benennt der Job)
+        wt = None
+        hw = read_small(os.path.join(out, "head_worktree"), 4096)
+        if hw is not None:
+            cand = os.path.realpath(hw.decode("utf-8", "replace").strip())
+            if cand.startswith(os.path.realpath(scratch) + os.sep) and os.path.isdir(cand):
+                wt = cand
+        res = {"schema": "graph.run.v1", "nonce": spec["nonce"], "graph_run_id": spec["graph_run_id"], "key": spec["key"], "job": spec["job"], "ok": ok,
+               "script_sha256": sha, "started_at": started, "ended_at": ended, "detail": detail}
+        rj = os.path.join(scratch, "result-in.json")
+        with open(rj, "w", encoding="utf-8") as f:
+            json.dump(res, f, ensure_ascii=False)
+        rp = os.path.join(scratch, "report-in.md")
+        with open(rp, "w", encoding="utf-8") as f:
+            f.write(text)
+        wr = os.environ.get("FORGE_RUN_WRITE_RESULT", os.path.join(HERE, "forge-write-result"))
+        cmd = [sys.executable, "-I", wr, "--nonce", spec["nonce"], "--exclusive", "--report", rp] + (["--worktree", wt] if wt else []) + [f"{spec['graph_run_id']}/{spec['key']}", rj]
+        wenv = {"PATH": "/usr/local/bin:/usr/bin:/bin", "FORGE_GRAPH_DIR": root}
+        w = subprocess.run(cmd, env=wenv, stdin=subprocess.DEVNULL, capture_output=True, timeout=120, check=False)
+        if w.returncode != 0:
+            msg = w.stderr.decode("utf-8", "replace").strip().splitlines()[-1:] or ["forge-write-result fehlgeschlagen"]
+            sys.stderr.write(f"forge-run-job: Ergebnis nicht schreibbar: {msg[0][:300]}\n")
+            log({"type": "run-job.finished", "job": spec["job"], "exit": 70, "job_exit": rc, "result": "not_written", "reason": msg[0][:200]})
+            sys.exit(70)
+        log({"type": "run-job.finished", "job": spec["job"], "exit": rc, "ok": ok, "result": "written", "head": (w.stdout.decode().split("head ")[-1].strip() if wt else None)})
+        sys.exit(rc)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv)
+    except SystemExit:
+        raise
+    except BaseException as e:                                    # nie ein Traceback / Exit 1: jede unerwartete Ausnahme ist ein interner Fehler (Exit 70)
+        sys.stderr.write(f"forge-run-job: interner Fehler ({type(e).__name__})\n")
+        log({"type": "run-job.finished", "exit": 70, "result": "unknown", "reason": type(e).__name__})
+        sys.exit(70)
