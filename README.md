@@ -23,7 +23,7 @@ Exit-Codes: 0 Job gelaufen + Ergebnis geschrieben (das **Urteil** steht in `resu
 `result.json` (`graph.run.v1`) und `report.md` schreibt ausschliesslich `forge-write-result --exclusive` (Schema, Nonce, Identitaet, atomar, nie ueber Vorhandenes); der Head (M-100) kommt dabei aus git (`--worktree`).
 `bin/jobs/ci-gate` ist echt: Branch-Spitze == `head` (sonst Exit 3), Checkout genau dieses Commits (`git clone --shared`, Quell-Repo unveraendert), Gates laut ops-eigener Tabelle `etc/ci-gates.json` (Gate ohne Eintrag =>
 `not_configured` => rot; Gate, das getrackte Dateien aendert => `tree_modified` => rot). Die uebrigen Jobs sind Stubs (Exit 64, `seam_run_jobs`) bis S5b1/S5b2.
-**Deploy (ordered restart):** zuerst bauen/pinnen (forge-core, Migration `0014_run_kind` VOR dem Watcher-Neustart, sonst scheitert die Registrierung eines RUN-Briefs am CHECK), dann Watcher mit `bin/forge-request-restart.sh "S2c RUN-Kind"`
+**Deploy (ordered restart):** zuerst bauen/pinnen (forge-core, Migration `0016_run_kind` (und `0017_run_orders`) VOR dem Watcher-Neustart, sonst scheitert die Registrierung eines RUN-Briefs am CHECK), dann Watcher mit `bin/forge-request-restart.sh "S2c RUN-Kind"`
 neu starten (wirkt nur zwischen zwei Runs, nie waehrend einer Einheit), `forge-write-result`/`forge-run-job` in den `PATH` der Executoren bzw. an den Watcher-Pfad. Kein Neustart waehrend STOP-Fenstern oder 02:00-05:45 Berlin.
 Tests: `tests/test_run_kind.sh` (Grammatik, Allowlist, jede Argument-Regel, Exit-Mapping, Environment, Zeitlimit, ci-gate, Stubs, G27), `tests/test_evidence_order.sh` (= `test_evidence_order_watcher`, Design W-3 am echten Watcher:
 Schnappschuss vor jedem `mv` + Abtastung; Reihenfolge Log -> Archiv -> Report; fuer Claude/Codex/RUN/ABGELEHNT/Exit 2).
