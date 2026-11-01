@@ -71,4 +71,31 @@ run --nonce 0a1b2c3d 42/build:1 "$T/o.json";                                    
 printf '{"schema":"graph.judge.v1","nonce":"0a1b2c3d","graph_run_id":42,"key":"build:1","recommend":"ABANDON","rulings":[],"rationale":"x"}' > "$T/j.json"
 run --nonce 0a1b2c3d 42/build:1 "$T/j.json";                                                               check "judge.v1 akzeptiert" test "$(rc)" = 0
 
+# --- Typen: jeder falsche Typ eines Top-Level-Felds => Exit 3, eine Zeile, Zieldatei unveraendert (kein Traceback) ---
+before=$(sha256sum "$FORGE_GRAPH_DIR/42/build:1/result.json")
+for v in '[]' '{}' '1' 'true' 'null' '"x"'; do
+  printf '{"schema":%s,"nonce":"0a1b2c3d","graph_run_id":42,"key":"build:1"}' "$v" > "$T/bad.json"; run --nonce 0a1b2c3d 42/build:1 "$T/bad.json"
+  if [ "$(rc)" = 3 ] && [ "$(wc -l < "$T/err")" = 1 ] && ! grep -q Traceback "$T/err"; then ok "schema=$v => Exit 3, eine Zeile"; else bad "schema=$v (rc=$(rc) err=$(cat "$T/err"))"; fi
+done
+fuzz_field() { # feld  gueltiger-Wert  falsche-Werte...
+  local f="$1" good="$2"; shift 2
+  for bv in "$@"; do
+    python3 - "$T/in.json" "$T/bad.json" "$f" "$bv" <<'PY'
+import json, sys
+o = json.load(open(sys.argv[1])); o[sys.argv[3]] = json.loads(sys.argv[4]); json.dump(o, open(sys.argv[2], "w"))
+PY
+    run --nonce 0a1b2c3d 42/build:1 "$T/bad.json"
+    if [ "$(rc)" = 3 ] && [ "$(wc -l < "$T/err")" = 1 ] && ! grep -q Traceback "$T/err"; then ok "Typ $f=$bv abgelehnt"; else bad "Typ $f=$bv (rc=$(rc) err=$(cat "$T/err"))"; fi
+  done
+}
+good_build > "$T/in.json"
+for f in schema nonce key head_sha branch self_check notes; do fuzz_field $f x '[]' '{}' '1' 'true' 'null'; done
+for f in graph_run_id; do fuzz_field $f x '[]' '{}' '"42"' 'true' 'null' '4.5'; done
+for f in files_changed reserved_hits finding_responses; do fuzz_field $f x '{}' '"x"' '1' 'true' 'null'; done
+printf '{"schema":"graph.review.v1","nonce":"0a1b2c3d","graph_run_id":42,"key":"rev:1","verdict":[],"reviewed_head":{},"findings":{}}' > "$T/bad.json"; run --nonce 0a1b2c3d 42/rev:1 "$T/bad.json"
+if [ "$(rc)" = 3 ] && [ "$(wc -l < "$T/err")" = 1 ]; then ok "review.v1 mit Fremdtypen abgelehnt"; else bad "review.v1 Fremdtypen (rc=$(rc))"; fi
+printf '{"schema":"graph.run.v1","nonce":"0a1b2c3d","graph_run_id":42,"key":"build:1","job":"ci-gate","ok":"yes"}' > "$T/bad.json"; run --nonce 0a1b2c3d 42/build:1 "$T/bad.json"
+if [ "$(rc)" = 3 ]; then ok "run.v1 ok als String abgelehnt"; else bad "run.v1 ok String (rc=$(rc))"; fi
+check "Zieldatei nach den Typ-Ablehnungen unveraendert" bash -c "[ \"\$(sha256sum '$FORGE_GRAPH_DIR/42/build:1/result.json')\" = \"$before\" ]"
+
 echo "---"; echo "PASS=$PASS FAIL=$FAIL"; [ "$FAIL" = 0 ]

@@ -27,6 +27,16 @@ SCHEMAS = {
 }
 
 
+# Grobe Typen der Top-Level-Felder (str/int/bool/list/dict/None=beliebig); Tiefenpruefung macht der Graph. Paritaet mit results.SPEC: Schluessel (Test), Typen hier zusaetzlich.
+STR, INT, BOOL, LIST, ANY = str, int, bool, list, None
+TYPES = {
+    "schema": STR, "nonce": STR, "graph_run_id": INT, "key": STR,
+    "head_sha": STR, "branch": STR, "files_changed": LIST, "self_check": STR, "notes": STR, "reserved_hits": LIST, "finding_responses": LIST,
+    "verdict": STR, "reviewed_head": STR, "findings": LIST, "recommend": STR, "rulings": LIST, "rationale": STR,
+    "job": STR, "ok": BOOL, "script_sha256": STR, "started_at": STR, "ended_at": STR, "detail": ANY,
+}
+
+
 def fail(code: int, msg: str):
     sys.stderr.write(f"forge-write-result: {msg}\n")
     sys.exit(code)
@@ -73,6 +83,10 @@ def main(argv):
         fail(3, f"kein gueltiges JSON: {str(e)[:120]}")
     if not isinstance(obj, dict):
         fail(3, "JSON muss ein Objekt sein")
+    for k, v in obj.items():                      # Typen VOR jedem Nachschlagen/Vergleich: ein Listen-/Objekt-Wert darf nie zu einer Ausnahme fuehren
+        want = TYPES.get(k, ANY)
+        if want is not ANY and (not isinstance(v, want) or (want is int and isinstance(v, bool))):
+            fail(3, f"Feld {k[:40]!r} hat den falschen Typ ({type(v).__name__}, erwartet {want.__name__})")
     schema = obj.get("schema")
     if schema not in SCHEMAS:
         fail(3, f"unbekanntes schema {str(schema)[:40]!r} (erlaubt: {', '.join(sorted(SCHEMAS))})")
@@ -121,4 +135,9 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    main(sys.argv)
+    try:
+        main(sys.argv)
+    except SystemExit:
+        raise
+    except BaseException as e:                    # nie ein Traceback / Exit 1: jede unerwartete Ausnahme ist "Datei ungueltig", Zieldatei bleibt unberuehrt (geschrieben wird erst nach allen Pruefungen)
+        fail(3, f"unerwarteter Fehler bei der Pruefung ({type(e).__name__})")
