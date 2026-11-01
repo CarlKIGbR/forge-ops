@@ -98,7 +98,7 @@ def main() -> int:
     flt = sys.argv[1] if len(sys.argv) > 1 else ""
     survivors, killed, napplied = [], 0, 0
     for name, rel, old, new, suite in MUTANTS:
-        if flt and flt not in name:
+        if flt and not any(f in name for f in flt.split("|")):
             continue
         with tempfile.TemporaryDirectory(prefix="mut.") as td:
             tree = Path(td) / "ops"
