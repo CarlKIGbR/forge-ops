@@ -82,6 +82,15 @@ MUTANTS = [
     ("write-result: assume-unchanged unbeachtet", "bin/forge-write-result", '''    if r.returncode != 0 or any(ln[:1] in (b"h", b"S", b"s") or ln[:1].islower() for ln in r.stdout.splitlines() if ln):''', '''    if False:''', WR),
     ("write-result: Infinity in der Eingabe erlaubt", "bin/forge-write-result", '''    if v != v or v in (float("inf"), float("-inf")):''', '''    if False:''', WR),
     ("write-result: Branch per --short (Tag-Mehrdeutigkeit)", "bin/forge-write-result", '''    r = git(worktree, "symbolic-ref", "-q", "HEAD")                  # voller''', '''    r = git(worktree, "symbolic-ref", "-q", "--short", "HEAD")                  # voller''', WR),
+    # Rework 1 MAJOR 1 (Autoritaet / Dispatch-Eintrag)
+    ("run-job: Dispatch-Eintrag wird nicht verbraucht", "bin/forge-run-job", "    consume_order(spec, SPEC_SHA[0], argv[1])", "    pass  # consume_order", RUN),
+    ("run-job: Nonce des Dateinamens nicht gegen den Auftrag geprueft", "bin/forge-run-job", 'if not m or m.group(1) != spec["nonce"]:', "if False:", RUN),
+    ("run-job: SQL ohne graph_run_id-Bedingung", "bin/forge-run-job", "f\"AND graph_run_id = {int(spec['graph_run_id'])} AND state = 'published' RETURNING 'consumed';\\n\")", "f\"AND state = 'published' RETURNING 'consumed';\\n\")", RUN),
+    ("run-job: SQL ohne sha256-Bedingung", "bin/forge-run-job", "AND spec_sha256 = '{spec_sha}' \"", "\"", RUN),
+    ("run-job: SQL verbraucht jeden Zustand (nicht nur published)", "bin/forge-run-job", "AND state = 'published' RETURNING", "RETURNING", RUN),
+    ("run-job: jede Datenbankantwort gilt als verbraucht", "bin/forge-run-job", 'if p.stdout.decode("utf-8", "replace").strip() != "consumed":', "if False:", RUN),
+    ("run-job: DB-Fehler (psql-Exit != 0) gilt als verbraucht", "bin/forge-run-job", "    if p.returncode != 0:\n        reject(69", "    if False:\n        reject(69", RUN),
+    ("watcher: reicht FORGE_RUN_ORDER_PSQL nicht an den Runner durch", "bin/forge-postbote.sh", "FORGE_PG_CONTAINER FORGE_RUN_ORDER_PSQL FORGE_GRAPH_DIR", "FORGE_PG_CONTAINER FORGE_GRAPH_DIR", RUN),
 ]
 
 
