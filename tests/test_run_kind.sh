@@ -252,8 +252,10 @@ FORGE_RUN_MAX_SECONDS=2 bash "$OPS/bin/forge-postbote.sh" --once >"$T/watcher.ou
 check "Zeitlimit: Exit-Code 124 im Report"                 test "$(hdr Exit-Code)" = 124
 check "Zeitlimit: Hinweis im Report"                       grep -q 'Zeitlimit' "$(REPORT)"
 sleep 1
-check "Zeitlimit: Job-Prozess beendet"                     bash -c "! kill -0 \$(cat '$T/slow.pid') 2>/dev/null"
-check "Zeitlimit: Kindprozess des Jobs beendet"            bash -c "! kill -0 \$(cat '$T/slow.child.pid') 2>/dev/null"
+# "lebt" = existiert und ist kein Zombie (in Containern ohne init bleibt ein verwaister, beendeter Prozess als Zombie stehen)
+alive() { [ -r "/proc/$1/status" ] && ! grep -q '^State:[[:space:]]*Z' "/proc/$1/status"; }
+check "Zeitlimit: Job-Prozess beendet"                     bash -c "$(declare -f alive); ! alive \$(cat '$T/slow.pid')"
+check "Zeitlimit: Kindprozess des Jobs beendet"            bash -c "$(declare -f alive); ! alive \$(cat '$T/slow.child.pid')"
 check "Zeitlimit: Brief trotzdem archiviert"               bash -c "ls '$POST/erledigt/'*_'$NAME'"
 
 # ================= 7. Echte Jobs: ci-gate =================
