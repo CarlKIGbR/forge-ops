@@ -69,6 +69,33 @@ def load_gates(repo_name):
 def limit():
     resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_GATE_OUTPUT, MAX_GATE_OUTPUT))
     os.setsid()
+    try:                                                         # stirbt ci-gate (SIGKILL), stirbt auch das Gate
+        import ctypes
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)       # PR_SET_PDEATHSIG
+    except Exception:
+        pass
+
+
+GATE_PROCS: list = []                                              # laufendes Gate (eigene Sitzung/Prozessgruppe); fuer SIGTERM von forge-run-job (Zeitlimit des Watchers)
+
+
+def kill_gate(sig=signal.SIGTERM):
+    for p in GATE_PROCS:
+        for s_ in (sig, signal.SIGKILL):
+            try:
+                os.killpg(p.pid, s_)
+            except OSError:
+                pass
+            try:
+                p.wait(timeout=5)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+
+
+def on_term(signum, frame):
+    kill_gate()
+    sys.exit(124 if signum == signal.SIGTERM else 130)
 
 
 def run_gate(name, spec, cwd, home, logpath):
@@ -82,6 +109,7 @@ def run_gate(name, spec, cwd, home, logpath):
     try:
         with open(logpath, "wb") as lf:
             p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT, preexec_fn=limit, close_fds=True)
+            GATE_PROCS.append(p)
             try:
                 rc = p.wait(timeout=timeout)
                 status = "pass" if rc == 0 else "fail"
@@ -97,6 +125,9 @@ def run_gate(name, spec, cwd, home, logpath):
                         break
                     except subprocess.TimeoutExpired:
                         continue
+            finally:
+                kill_gate()                                      # nach jedem Gate: Reste der Prozessgruppe (Hintergrundprozesse des Gates) beenden
+                GATE_PROCS.clear()
     except OSError as e:
         return {"name": name, "status": "error", "reason": f"cannot_start:{type(e).__name__}", "exit": None, "seconds": round(time.monotonic() - t0, 1)}
     try:
@@ -109,6 +140,8 @@ def run_gate(name, spec, cwd, home, logpath):
 
 
 def main(argv):
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
     if len(argv) != 5:
         print("ci-gate: Aufruf: ci-gate <repo-pfad> <branch> <head> <gate,gate,...>", file=sys.stderr)
         return 2
@@ -144,7 +177,6 @@ def main(argv):
     except Exception as e:                                       # Checkout nicht herstellbar: das ist ein Job-Fehler, kein Gate-Urteil
         print(f"ci-gate: Checkout fehlgeschlagen: {e}")
         return finish({**base, "reason": "checkout_failed", "error": str(e)[:200]}, False, f"Checkout of `{head}` failed: {str(e)[:200]}\n", 70)
-    open(os.path.join(out, "head_worktree"), "w").write(checkout)
     table = load_gates(base["repo"])
     results = []
     gdir = os.path.join(scratch, "gatelogs")
@@ -155,12 +187,19 @@ def main(argv):
             r = {"name": g, "status": "not_configured", "exit": None, "seconds": 0.0}
         else:
             r = run_gate(g, spec, checkout, home, os.path.join(gdir, f"{g}.log"))
+            now = git(checkout, "rev-parse", "HEAD").stdout.decode().strip()
+            if now != head:                                      # ein Gate hat HEAD des Checkouts bewegt (commit/checkout): rot, Checkout auf den Head zurueck
+                r["status"], r["reason"] = "head_moved", f"gate moved HEAD to {now[:12]}"
+                git(checkout, "reset", "-q", "--hard", head)
             dirty = git(checkout, "status", "--porcelain=v1", "--untracked-files=no").stdout.strip()
             if dirty:                                            # ein Gate darf getrackte Dateien nicht aendern: rot, Checkout zuruecksetzen
                 r["status"], r["reason"] = "tree_modified", "gate modified tracked files"
                 git(checkout, "reset", "-q", "--hard", head)
         results.append(r)
+    git(checkout, "reset", "-q", "--hard", head)                 # Zustand des Checkouts == Head, bevor forge-write-result ihn ausliest
     git(checkout, "clean", "-q", "-fdx")                         # ungetrackte Gate-Artefakte weg (der Head-Worktree ist der saubere Checkout)
+    if git(checkout, "rev-parse", "HEAD").stdout.decode().strip() == head:
+        open(os.path.join(out, "head_worktree"), "w").write(checkout)       # ERST jetzt: ohne diese Datei traegt das Ergebnis keinen Head (ingest: head_missing)
     tip1 = tip_of(repo, branch)
     green = all(r["status"] == "pass" for r in results)
     detail = {**base, "tip_at_start": tip0, "tip_at_end": tip1, "gates": results, "all_green": green}

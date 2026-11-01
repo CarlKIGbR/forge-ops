@@ -61,6 +61,27 @@ MUTANTS = [
             os.unlink(tmp)''', '''            os.rename(tmp, final)''', WR),
     ("write-result: fsmonitor nicht abgeschaltet", "bin/forge-write-result", '''["git", "-c", "core.fsmonitor=false", "-C", worktree, *args]''', '''["git", "-C", worktree, *args]''', WR),
     ("write-result: losgeloester HEAD fuer build erlaubt", "bin/forge-write-result", '''    if want_branch and not branch:''', '''    if False:''', WR),
+    # Rework 1 (Reviewer-Funde)
+    ("ci-gate: bewegter Checkout-HEAD nicht erkannt", "bin/jobs/ci-gate", '''            if now != head:''', '''            if False:''', RUN),
+    ("ci-gate: SIGTERM-Handler fehlt", "bin/jobs/ci-gate", '''    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    if len(argv) != 5:''', '''    if len(argv) != 5:''', RUN),
+    ("ci-gate: Gate-Reste werden nach dem Gate nicht beendet", "bin/jobs/ci-gate", '''            finally:
+                kill_gate()''', '''            finally:
+                pass''', RUN),
+    ("run-job: Manipulation der Einheit waehrend des Jobs nicht erkannt", "bin/forge-run-job", '''        for name in ("result.json", "report.md"):                  # waehrend''', '''        for name in ():                  # waehrend''', RUN),
+    ("run-job: head_worktree beliebig", "bin/forge-run-job", '''            if cand == os.path.join(os.path.realpath(scratch), "checkout") and os.path.isdir(cand):''', '''            if os.path.isdir(cand):''', RUN),
+    ("run-job: Wegwerf-Bereich bleibt liegen", "bin/forge-run-job", '''        shutil.rmtree(scratch, ignore_errors=True)''', '''        pass''', RUN),
+    ("run-job: Surrogat-Absicherung der Ablehnung entfernt", "bin/forge-run-job", '''    return msg.encode("utf-8", "replace").decode("utf-8", "replace").replace("\\n", " ")''', '''    return msg''', RUN),
+    ("run-job: Job-Environment nicht geleert (direkter Aufruf)", "bin/forge-run-job", '''    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": os.path.join(scratch, "home"),''', '''    env = {**os.environ, "PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": os.path.join(scratch, "home"),''', RUN),
+    ("watcher: Executor-Environment an forge-run-job (kein env -i)", "bin/forge-postbote.sh", '''timeout "${FORGE_RUN_MAX_SECONDS:-3900}" env -i "${renv[@]}" "$bin"''', '''timeout "${FORGE_RUN_MAX_SECONDS:-3900}" env "${renv[@]}" "$bin"''', RUN),
+    ("write-result: Head-Zeilen nur in der ersten Zeile geprueft", "bin/forge-write-result", '''            if m and m.group(1) != head:
+                fail(3, f"die getippte Report-Zeile 'Head: {m.group(1)[:50]}' weicht von git rev-parse HEAD ({head}) ab - den Head nicht tippen, das Werkzeug erzeugt die Kopfzeile")
+        lines''', '''            pass
+        lines''', WR),
+    ("write-result: assume-unchanged unbeachtet", "bin/forge-write-result", '''    if r.returncode != 0 or any(ln[:1] in (b"h", b"S", b"s") or ln[:1].islower() for ln in r.stdout.splitlines() if ln):''', '''    if False:''', WR),
+    ("write-result: Infinity in der Eingabe erlaubt", "bin/forge-write-result", '''    if v != v or v in (float("inf"), float("-inf")):''', '''    if False:''', WR),
+    ("write-result: Branch per --short (Tag-Mehrdeutigkeit)", "bin/forge-write-result", '''    r = git(worktree, "symbolic-ref", "-q", "HEAD")                  # voller''', '''    r = git(worktree, "symbolic-ref", "-q", "--short", "HEAD")                  # voller''', WR),
 ]
 
 

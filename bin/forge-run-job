@@ -108,8 +108,14 @@ def utcl() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def clean(msg: str) -> str:
+    """Nur druckbares UTF-8 (ein einzelnes Surrogat in einem Schluessel des Auftrags darf die Ablehnung nicht zum Absturz bringen)."""
+    return msg.encode("utf-8", "replace").decode("utf-8", "replace").replace("\n", " ")
+
+
 def reject(code: int, msg: str, started: str | None = None):
     """Eine Zeile auf stderr, eine JSON-Zeile auf stdout (Run-Log), Report-Text in FORGE_RUN_BODY; nichts wurde ausgefuehrt."""
+    msg = clean(msg)
     sys.stderr.write(f"forge-run-job: {msg}\n")
     log({"type": "run-job.finished", "exit": code, "result": "not_written", "reason": msg[:200]})
     body = os.environ.get("FORGE_RUN_BODY")
@@ -123,7 +129,7 @@ def reject(code: int, msg: str, started: str | None = None):
 
 
 def log(obj: dict) -> None:
-    sys.stdout.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+    sys.stdout.write(json.dumps(obj, ensure_ascii=True, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
 
@@ -138,6 +144,13 @@ def no_dup(pairs):
 
 def bad_const(name):
     raise ValueError("%s ist kein gueltiges JSON" % name)
+
+
+def finite_float(text):
+    v = float(text)
+    if v != v or v in (float("inf"), float("-inf")):
+        raise ValueError("Zahl ausserhalb des Gleitkommabereichs")
+    return v
 
 
 def load_repos() -> set[str]:
@@ -161,7 +174,7 @@ def parse_spec(path: str) -> dict:
     if len(data) > MAX_SPEC:
         reject(65, "Auftrag groesser als 64 KB")
     try:
-        spec = json.loads(data.decode("utf-8"), object_pairs_hook=no_dup, parse_constant=bad_const)
+        spec = json.loads(data.decode("utf-8"), object_pairs_hook=no_dup, parse_constant=bad_const, parse_float=finite_float)
     except (ValueError, RecursionError):
         reject(65, "Auftrag ist kein gueltiges JSON-Objekt (strikt: keine doppelten Schluessel, kein NaN)")
     if not isinstance(spec, dict):
@@ -350,7 +363,7 @@ def main(argv: list[str]) -> None:
         detail: dict = {}
         if raw is not None:
             try:
-                d = json.loads(raw.decode("utf-8"), object_pairs_hook=no_dup, parse_constant=bad_const)
+                d = json.loads(raw.decode("utf-8"), object_pairs_hook=no_dup, parse_constant=bad_const, parse_float=finite_float)
                 detail = d if isinstance(d, dict) else {"job_detail": d}
             except (ValueError, RecursionError):
                 detail = {"error": "detail.json des Jobs ist kein gueltiges JSON"}
@@ -379,8 +392,13 @@ def main(argv: list[str]) -> None:
         hw = read_small(os.path.join(out, "head_worktree"), 4096)
         if hw is not None:
             cand = os.path.realpath(hw.decode("utf-8", "replace").strip())
-            if cand.startswith(os.path.realpath(scratch) + os.sep) and os.path.isdir(cand):
+            if cand == os.path.join(os.path.realpath(scratch), "checkout") and os.path.isdir(cand):     # genau der Checkout, den der Job im Wegwerf-Bereich angelegt hat
                 wt = cand
+        for name in ("result.json", "report.md"):                  # waehrend des Jobs darf die Einheit keine Ergebnisdateien bekommen (ein Gate/Job schreibt nie am Werkzeug vorbei)
+            if os.path.lexists(os.path.join(root, str(spec["graph_run_id"]), spec["key"], name)):
+                sys.stderr.write(f"forge-run-job: {name} ist waehrend des Jobs in der Einheit aufgetaucht (Manipulation): kein Ergebnis geschrieben\n")
+                log({"type": "run-job.finished", "job": spec["job"], "exit": 70, "job_exit": rc, "result": "not_written", "reason": "unit_tampered"})
+                sys.exit(70)
         res = {"schema": "graph.run.v1", "nonce": spec["nonce"], "graph_run_id": spec["graph_run_id"], "key": spec["key"], "job": spec["job"], "ok": ok,
                "script_sha256": sha, "started_at": started, "ended_at": ended, "detail": detail}
         rj = os.path.join(scratch, "result-in.json")

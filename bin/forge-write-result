@@ -74,6 +74,13 @@ def bad_const(name):
     raise ValueError(f"{name} ist kein gueltiges JSON")
 
 
+def finite_float(text):
+    v = float(text)
+    if v != v or v in (float("inf"), float("-inf")):
+        raise ValueError("Zahl ausserhalb des Gleitkommabereichs (1e999) ist kein gueltiges JSON")
+    return v
+
+
 def read_regular(path: str, limit: int, what: str) -> bytes:
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
@@ -118,8 +125,12 @@ def capture_head(worktree: str, want_branch: bool) -> tuple[str, str | None]:
         fail(3, "git status fehlgeschlagen")
     if r.stdout.strip():
         fail(3, "der Worktree hat nicht committete Aenderungen an getrackten Dateien: der Head ist nur der ENDGUELTIGE Commit - erst committen, dann forge-write-result aufrufen")
-    r = git(worktree, "symbolic-ref", "-q", "--short", "HEAD")
-    branch = r.stdout.decode("utf-8", "replace").strip() if r.returncode == 0 else None
+    r = git(worktree, "ls-files", "-v")
+    if r.returncode != 0 or any(ln[:1] in (b"h", b"S", b"s") or ln[:1].islower() for ln in r.stdout.splitlines() if ln):
+        fail(3, "der Index versteckt Dateien (assume-unchanged/skip-worktree): der Zustand des Worktrees ist nicht belegbar - Flags entfernen (git update-index --no-assume-unchanged / --no-skip-worktree)")
+    r = git(worktree, "symbolic-ref", "-q", "HEAD")                  # voller Ref-Name (kein --short: ein Tag gleichen Namens wuerde "heads/<name>" liefern)
+    ref = r.stdout.decode("utf-8", "replace").strip() if r.returncode == 0 else ""
+    branch = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else None
     if want_branch and not branch:
         fail(3, "HEAD des Worktrees ist losgeloest (detached): auf dem Branch der Einheit arbeiten und dort committen")
     return head, branch
@@ -137,13 +148,17 @@ def compose_report(body: bytes, head: str | None) -> bytes:
     if head is None:
         out = text
     else:
-        first, _, rest = text.lstrip("\n").partition("\n")
-        m = re.fullmatch(r"\s*Head:\s*(\S*)\s*", first)
-        if m:                                                      # selbst getippte Kopfzeile: nur gueltig, wenn sie dem erzeugten Head entspricht; ersetzt durch die erzeugte
-            if m.group(1) != head:
+        for ln in text.splitlines():                              # JEDE getippte 'Head:'-Zeile des Textes muss dem erzeugten Head entsprechen (nicht nur die erste)
+            m = re.fullmatch(r"\s*Head:\s*(\S*)\s*", ln)
+            if m and m.group(1) != head:
                 fail(3, f"die getippte Report-Zeile 'Head: {m.group(1)[:50]}' weicht von git rev-parse HEAD ({head}) ab - den Head nicht tippen, das Werkzeug erzeugt die Kopfzeile")
-            text = rest
-        out = f"Head: {head}\n\n{text.lstrip(chr(10))}"
+        lines = text.splitlines()
+        while lines and not lines[0].strip():                      # fuehrende Leerzeilen (auch \r, Leerzeichen) weg
+            lines.pop(0)
+        if lines and re.fullmatch(r"\s*Head:\s*\S*\s*", lines[0]):  # getippte, korrekte Kopfzeile: durch die erzeugte ersetzt
+            lines.pop(0)
+        body = "\n".join(lines).lstrip("\n")
+        out = f"Head: {head}\n\n{body}" + ("\n" if body and not body.endswith("\n") else "")
     data = out.encode("utf-8")
     if len(data) > MAX_REPORT:
         fail(3, f"report.md waere groesser als {MAX_REPORT // 1024} KB")
@@ -215,7 +230,7 @@ def main(argv):
     gid, key = int(m.group(1)), m.group(2)
     data = read_regular(src, MAX_BYTES, "JSON-Datei")
     try:
-        obj = json.loads(data.decode("utf-8"), object_pairs_hook=no_dup, parse_constant=bad_const)
+        obj = json.loads(data.decode("utf-8"), object_pairs_hook=no_dup, parse_constant=bad_const, parse_float=finite_float)
     except (ValueError, RecursionError) as e:
         fail(3, f"kein gueltiges JSON: {str(e)[:120]}")
     if not isinstance(obj, dict):

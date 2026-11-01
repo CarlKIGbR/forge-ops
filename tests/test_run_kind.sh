@@ -297,6 +297,73 @@ NEWTIP=$(G rev-parse feat/x)
 check "G28: Branch bewegt sich waehrend der Gates => tip_at_end != Head, Ergebnis bleibt am Head" bash -c "[ \"$(rj "$U/result.json" detail.tip_at_start)\" = $HEAD ] && [ \"$(rj "$U/result.json" detail.tip_at_end)\" = $NEWTIP ] && [ \"$(rj "$U/result.json" head_sha)\" = $HEAD ]"
 HEAD2=$NEWTIP
 
+# --- Reviewer-Funde (S2c rework 1): Gates duerfen weder HEAD bewegen noch die Einheit manipulieren noch Prozesse hinterlassen ---
+export TMPDIR="$T/tmp"; mkdir -p "$TMPDIR"
+cat > "$T/gates3.json" <<EOF
+{"fixrepo": {"lint": {"argv": ["bash", "-c", "git -c user.name=t -c user.email=t@t commit -q --allow-empty -m moved; echo moved head"]}}}
+EOF
+FORGE_RUN_GATES_FILE="$T/gates3.json" cigate '["lint"]' "$HEAD2"
+check "Gate bewegt HEAD des Checkouts => head_moved (rot)"                     test "$(rj "$U/result.json" detail.gates.0.status)" = head_moved
+check "  ... Ergebnis-Head bleibt der geprueftte Head, ok=false"               bash -c "[ \"$(rj "$U/result.json" head_sha)\" = $HEAD2 ] && [ \"$(rj "$U/result.json" ok)\" = false ]"
+# Probe-Job schreibt WAEHREND des Laufs result.json in die Einheit => Manipulation, Exit 70, die eingeschleuste Datei wird nicht ersetzt
+export FORGE_RUN_JOBS_DIR="$PJ"
+newname
+cat > "$PJ/ci-gate" <<EOF
+#!/usr/bin/env bash
+printf '{"ok":true}' > "\$FORGE_JOB_OUT/detail.json"
+printf 'FORGED' > "$POST/graph/$GID/$KEY/result.json"
+EOF
+chmod +x "$PJ/ci-gate"
+printf '%s' "$(spec ci-gate "$G1")" > "$POST/eingang/$NAME"; watch
+check "Job schreibt result.json in die Einheit => Exit 70 (Manipulation)"     test "$(hdr Exit-Code)" = 70
+check "  ... die eingeschleuste Datei wird nicht ueberschrieben"               test "$(cat "$U/result.json")" = FORGED
+check "  ... Meldung nennt die Manipulation"                                    grep -q 'Manipulation' "$(logf stderr)"
+# head_worktree ausserhalb des Wegwerf-Bereichs => ignoriert (kein Head im Ergebnis)
+newname
+cat > "$PJ/ci-gate" <<EOF
+#!/usr/bin/env bash
+printf '{"ok":true}' > "\$FORGE_JOB_OUT/detail.json"
+printf '%s' "$R" > "\$FORGE_JOB_OUT/head_worktree"
+EOF
+printf '%s' "$(spec ci-gate "$G1")" > "$POST/eingang/$NAME"; watch
+check "head_worktree ausserhalb des Wegwerf-Bereichs wird ignoriert"          bash -c "[ \"$(hdr Exit-Code)\" = 0 ] && ! grep -q head_sha '$U/result.json' && ! head -1 '$U/report.md' | grep -q '^Head:'"
+# forge-run-job DIREKT mit verschmutztem Environment: der Job sieht nichts davon
+newname
+cat > "$PJ/ci-gate" <<EOF
+#!/usr/bin/env bash
+env | sort > "$T/direct-env.txt"
+printf '{"ok":true}' > "\$FORGE_JOB_OUT/detail.json"
+EOF
+printf '%s' "$(spec ci-gate "$G1")" > "$T/direct-spec.json"
+FORGE_MCP_TOKEN=SECRET-X OTEL_EXPORTER_OTLP_ENDPOINT=http://leak.invalid ANTHROPIC_API_KEY=sk-x python3 "$OPS/bin/forge-run-job" "$T/direct-spec.json" >/dev/null 2>&1
+check "forge-run-job direkt: Job-Env ohne MCP/OTEL/ANTHROPIC"                  bash -c "! grep -qi 'SECRET-X\|OTEL\|ANTHROPIC\|leak.invalid' '$T/direct-env.txt' && grep -q '^FORGE_JOB_OUT=' '$T/direct-env.txt'"
+# Watcher -> forge-run-job: nur die feste Variablenliste, nie das Executor-Environment
+cat > "$T/envprobe" <<EOF
+#!/usr/bin/env bash
+env | sort > "$T/watcher-env.txt"
+exit 0
+EOF
+chmod +x "$T/envprobe"; newname; printf '%s' "$(spec ci-gate "$G1")" > "$POST/eingang/$NAME"
+FORGE_RUN_JOB_BIN="$T/envprobe" watch
+check "Watcher->forge-run-job: kein MCP-Token/OTEL/CLAUDE im Environment"      bash -c "! grep -qi 'MCP\|OTEL\|SECRET\|CLAUDE\|CODEX' '$T/watcher-env.txt'"
+check "Watcher->forge-run-job: nur PATH/HOME/LANG/TMPDIR/FORGE_BASE/FORGE_RUN_*" bash -c "! grep -v '^\(PATH\|HOME\|LANG\|TMPDIR\|FORGE_BASE\|FORGE_RUN_[A-Z_]*\|FORGE_GRAPH_DIR\|PWD\|SHLVL\|_\|OLDPWD\)=' '$T/watcher-env.txt' | grep -q ."
+# Zeitlimit mit Gate, das einen Hintergrundprozess in eigener Sitzung hat: ci-gate raeumt per SIGTERM auf
+unset FORGE_RUN_JOBS_DIR
+cat > "$T/gates4.json" <<EOF
+{"fixrepo": {"format": {"argv": ["bash", "-c", "echo \$\$ > $T/gate.pid; sleep 313 & echo \$! > $T/gate.child.pid; wait"], "timeout": 600}}}
+EOF
+newname; printf '%s' "$(spec ci-gate "$(CI_ARGS "$HEAD2" '["format"]')")" > "$POST/eingang/$NAME"
+FORGE_RUN_GATES_FILE="$T/gates4.json" FORGE_RUN_MAX_SECONDS=3 bash "$OPS/bin/forge-postbote.sh" --once >"$T/watcher.out" 2>&1
+sleep 1
+check "Zeitlimit mit Gate: Exit 124"                                           test "$(hdr Exit-Code)" = 124
+check "Zeitlimit: Gate-Prozess beendet"                                        bash -c "$(declare -f alive); ! alive \$(cat '$T/gate.pid')"
+check "Zeitlimit: Hintergrundprozess des Gates beendet"                        bash -c "$(declare -f alive); ! alive \$(cat '$T/gate.child.pid')"
+check "Zeitlimit-Hinweis eines RUN nennt das RUN-Limit"                        grep -q 'FORGE_RUN_MAX_SECONDS' "$(REPORT)"
+check "Wegwerf-Bereiche aller Laeufe entfernt (TMPDIR leer)"                   bash -c "[ -z \"\$(ls -A '$TMPDIR')\" ]"
+# Auftrag mit einzelnem Surrogat im Schluessel => 65 (nicht 70), eine Zeile
+N=$((N+1)); NAME="RUN_forge-t$N.n-$(printf '%08x' $((0xa0000000 + N))).md"; printf '{"job":"ci-gate","args":{},"graph_run_id":1,"key":"k","nonce":"a0000001","\\ud800x":1}' > "$POST/eingang/$NAME"; watch
+check "Surrogat im Schluessel => Exit 65 mit einer Zeile"                      bash -c "[ \"$(hdr Exit-Code)\" = 65 ] && [ \"\$(wc -l < '$(logf stderr)')\" = 1 ]"
+
 # ================= 8. Stubs: Exit 64, nichts ausgefuehrt =================
 stubcase() { # job args extra
   newname; printf '%s' "$(spec "$1" "$2" "$3")" > "$POST/eingang/$NAME"; watch

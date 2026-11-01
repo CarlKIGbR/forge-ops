@@ -190,4 +190,37 @@ G config core.fsmonitor "touch $T/PWNED; echo"; mkb m100:3; run --nonce 0a1b2c3d
 check "M-100: core.fsmonitor des Worktrees wird nicht ausgefuehrt"              test ! -e "$T/PWNED"
 G config --unset core.fsmonitor
 
+# ===================== Reviewer-Funde (S2c rework 1) =====================
+mkdir -p "$FORGE_GRAPH_DIR/42/m100:4"
+mkb m100:4
+# Tag gleichen Namens wie der Branch: Branch-Name bleibt der volle Name
+G tag forge/m1 >/dev/null 2>&1; G tag topic >/dev/null 2>&1; G checkout -q -b topic 2>/dev/null
+mkb m100:4; run --nonce 0a1b2c3d 42/m100:4 "$T/m.json"
+check "Tag gleichen Namens: branch = 'topic' (nicht 'heads/topic')"            test "$(jget "$FORGE_GRAPH_DIR/42/m100:4/result.json" branch)" = topic
+mkb m100:4 branch='"topic"'; run --nonce 0a1b2c3d 42/m100:4 "$T/m.json"
+check "Tag gleichen Namens: korrekt getippter branch wird akzeptiert"          test "$(rc)" = 0
+mkb m100:4 branch='"heads/topic"'; run --nonce 0a1b2c3d 42/m100:4 "$T/m.json"; reject "Tag gleichen Namens: 'heads/topic' wird abgelehnt" 3 "Branch des Worktrees"
+G checkout -q forge/m1
+# 'Head:'-Zeilen irgendwo im Report-Text, fuehrende Leerzeilen mit \r / Leerzeichen
+for body in 'Text\nHead: bad2\n' '\r\nHead: badbadbad\nText\n' ' \nHead: badbad\nText\n' 'Text\n  Head:   deadbeef  \nMehr\n'; do
+  printf "$body" > "$T/rb.md"; mkb m100:4
+  python3 "$W" --nonce 0a1b2c3d --worktree "$WT" --report "$T/rb.md" 42/m100:4 "$T/m.json" >/dev/null 2>"$T/err"; echo $? > "$T/rc"
+  reject "falsche getippte Head-Zeile irgendwo im Report abgelehnt ($(printf '%q' "$body" | cut -c1-30))" 3 "Report-Zeile"
+done
+CUR=$(G rev-parse HEAD); printf '\r\n\r\nHead: %s\nText\n' "$CUR" > "$T/rb.md"; mkb m100:4
+python3 "$W" --nonce 0a1b2c3d --worktree "$WT" --report "$T/rb.md" 42/m100:4 "$T/m.json" >/dev/null 2>"$T/err"; echo $? > "$T/rc"
+check "getippte KORREKTE Kopfzeile nach Leerzeilen wird durch die erzeugte ersetzt (genau eine Head-Zeile)" bash -c "[ \"$(rc)\" = 0 ] && [ \"\$(grep -c '^Head:' '$FORGE_GRAPH_DIR/42/m100:4/report.md')\" = 1 ] && [ \"\$(head -n1 '$FORGE_GRAPH_DIR/42/m100:4/report.md')\" = 'Head: $CUR' ]"
+# 1e999 (Infinity) in der Eingabe => Exit 3, nie 'Infinity' im Ergebnis
+printf '{"schema":"graph.run.v1","nonce":"0a1b2c3d","graph_run_id":42,"key":"build:1","job":"ci-gate","ok":true,"detail":{"v":1e999}}' > "$T/inf.json"
+run --nonce 0a1b2c3d 42/build:1 "$T/inf.json"; reject "1e999 in der Eingabe => Exit 3" 3 "JSON"
+# assume-unchanged / skip-worktree verstecken Aenderungen => Exit 3
+echo hidden >> "$WT/a.txt"; G update-index --assume-unchanged a.txt
+mkb m100:4; run --nonce 0a1b2c3d 42/m100:4 "$T/m.json"; reject "assume-unchanged verdeckt eine Aenderung => Exit 3" 3 "versteckt"
+G update-index --no-assume-unchanged a.txt; G checkout -q -- a.txt
+G update-index --skip-worktree a.txt
+mkb m100:4; run --nonce 0a1b2c3d 42/m100:4 "$T/m.json"; reject "skip-worktree => Exit 3" 3 "versteckt"
+G update-index --no-skip-worktree a.txt
+mkb m100:4; run --nonce 0a1b2c3d 42/m100:4 "$T/m.json"
+check "nach Entfernen der Flags wieder moeglich"                               test "$(rc)" = 0
+
 echo "---"; echo "PASS=$PASS FAIL=$FAIL"; [ "$FAIL" = 0 ]
