@@ -360,6 +360,14 @@ check "Zeitlimit: Gate-Prozess beendet"                                        b
 check "Zeitlimit: Hintergrundprozess des Gates beendet"                        bash -c "$(declare -f alive); ! alive \$(cat '$T/gate.child.pid')"
 check "Zeitlimit-Hinweis eines RUN nennt das RUN-Limit"                        grep -q 'FORGE_RUN_MAX_SECONDS' "$(REPORT)"
 check "Wegwerf-Bereiche aller Laeufe entfernt (TMPDIR leer)"                   bash -c "[ -z \"\$(ls -A '$TMPDIR')\" ]"
+# Gate beendet sich normal, laesst aber einen Hintergrundprozess zurueck: ci-gate raeumt die Prozessgruppe des Gates nach jedem Gate auf
+cat > "$T/gates5.json" <<EOF
+{"fixrepo": {"format": {"argv": ["bash", "-c", "( sleep 313 ) & echo \$! > $T/leftover.pid; exit 0"]}}}
+EOF
+FORGE_RUN_GATES_FILE="$T/gates5.json" cigate '["format"]' "$HEAD2"
+sleep 1
+check "Gate mit Hintergrundprozess: Gate gruen"                                 test "$(rj "$U/result.json" detail.gates.0.status)" = pass
+check "  ... Hintergrundprozess nach dem Gate beendet"                          bash -c "$(declare -f alive); ! alive \$(cat '$T/leftover.pid')"
 # Auftrag mit einzelnem Surrogat im Schluessel => 65 (nicht 70), eine Zeile
 N=$((N+1)); NAME="RUN_forge-t$N.n-$(printf '%08x' $((0xa0000000 + N))).md"; printf '{"job":"ci-gate","args":{},"graph_run_id":1,"key":"k","nonce":"a0000001","\\ud800x":1}' > "$POST/eingang/$NAME"; watch
 check "Surrogat im Schluessel => Exit 65 mit einer Zeile"                      bash -c "[ \"$(hdr Exit-Code)\" = 65 ] && [ \"\$(wc -l < '$(logf stderr)')\" = 1 ]"

@@ -56,7 +56,7 @@ MUTANTS = [
     ("write-result: ungetrackte Aenderungen unbeachtet -> getrackte auch", "bin/forge-write-result", '''    if r.stdout.strip():
         fail(3, "der Worktree hat nicht''', '''    if False:
         fail(3, "der Worktree hat nicht''', WR),
-    ("write-result: getippte falsche Report-Kopfzeile erlaubt", "bin/forge-write-result", '''            if m.group(1) != head:''', '''            if False:''', WR),
+    ("write-result: getippte falsche Report-Kopfzeile erlaubt", "bin/forge-write-result", '''            if m and m.group(1) != head:''', '''            if False:''', WR),
     ("write-result: --exclusive ersetzt trotzdem", "bin/forge-write-result", '''            os.link(tmp, final)                                  # scheitert, wenn final existiert (kein Ersetzen)
             os.unlink(tmp)''', '''            os.rename(tmp, final)''', WR),
     ("write-result: fsmonitor nicht abgeschaltet", "bin/forge-write-result", '''["git", "-c", "core.fsmonitor=false", "-C", worktree, *args]''', '''["git", "-C", worktree, *args]''', WR),
