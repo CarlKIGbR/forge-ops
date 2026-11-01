@@ -1,1 +1,3 @@
 *.teil
+__pycache__/
+*.pyc
