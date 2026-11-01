@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""Test-Ersatz fuer den psql-Aufruf des Runners (bin/forge-run-job consume_order): bildet NUR die Semantik von core.graph_run_orders nach (published -> running, genau einmal).
+Die echte Datenbank-Semantik (Trigger, Rollen, Zustandsfolge) prueft die Kern-Testsuite gegen die echte Test-DB (tests/test_f5c2_s2c_runorders.py).
+Aufruf: fake-psql --state <datei>   (SQL auf stdin). Zustandsdatei: je Zeile `nonce sha256 graph_run_id state`; fehlt die Datei => Exit 2 (Datenbank nicht erreichbar)."""
+import os
+import re
+import sys
+
+state = sys.argv[sys.argv.index("--state") + 1]
+sql = sys.stdin.read()
+if not os.path.exists(state):
+    sys.stderr.write("psql: could not connect to server\n")
+    sys.exit(2)
+m = re.fullmatch(r"UPDATE core\.graph_run_orders SET state = 'running', started_at = now\(\) WHERE nonce = '([0-9a-f]{8})' AND spec_sha256 = '([0-9a-f]{64})' AND graph_run_id = (\d+) AND state = 'published' RETURNING 'consumed';\s*", sql)
+if not m:
+    sys.stderr.write("fake-psql: unexpected SQL\n")
+    sys.exit(3)
+rows = [ln.split() for ln in open(state).read().splitlines() if ln.strip()]
+hit = False
+for r in rows:
+    if r[:3] == [m.group(1), m.group(2), m.group(3)] and r[3] == "published" and not hit:
+        r[3] = "running"
+        hit = True
+open(state, "w").write("".join(" ".join(r) + "\n" for r in rows))
+if hit:
+    print("consumed")

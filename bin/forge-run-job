@@ -9,10 +9,14 @@ DER eine Weg (G27): kein Job laeuft ausser ueber diese Datei. Reihenfolge der Wa
   2. `job` steht in der festen Allowlist JOBS; `args` hat GENAU die Schluessel des Jobs, jeder Wert passt zu seiner Regex/Aufzaehlung (40-Hex-Shas, Repo-Name aus der Repo-Liste, Branch-Muster,
      ganzzahlige Deployment-ID, feste Gate-/Stage-Namen); `lock_token` ist fuer Jobs mit Lock Pflicht, sonst verboten
   3. Einheiten-Verzeichnis <FORGE_GRAPH_DIR>/<graph_run_id>/<key> existiert als Verzeichnis (kein Symlink) und enthaelt noch weder result.json noch report.md (Exit 66)
+  3b. AUTORITAET (ADR-028, S2c rework 1): der Auftrag wird nur ausgefuehrt, wenn der Graph ihn bestellt hat. Unmittelbar vor dem Start wird der Dispatch-Eintrag (core.graph_run_orders: Nonce + graph_run_id +
+     sha256 der Auftragsdatei, Zustand `published`) atomar verbraucht (`published -> running`, genau einmal). Kein Eintrag / abweichende sha256 / bereits verbraucht / Datenbank nicht erreichbar => Exit 65 bzw. 69,
+     KEINE Wirkung (kein Job, kein Ergebnis). Das gilt auch, wenn der Watcher die Datei vor dem Importer aufgreift. Datenbankzugang: `docker exec -i $FORGE_PG_CONTAINER psql ...` (wie scripts/*.sh) oder der in
+     FORGE_RUN_ORDER_PSQL (JSON-Liste, Test) gegebene psql-Aufruf.
   4. Der Job `bin/jobs/<job>` (Datei aus dem festen Verzeichnis, kein Pfad aus dem Auftrag) laeuft mit leerem Environment, eigener Prozessgruppe und Zeitlimit; Ausgabe wird in eine Datei geleitet
   5. result.json (graph.run.v1) und report.md schreibt NUR forge-write-result (Schema, Nonce, Identitaet, atomar, --exclusive); der Head (M-100) kommt dabei aus git (--worktree, vom Job benannt),
      nie aus dem Auftrag oder der Job-Ausgabe
-Exit-Codes: 0 Job ausgefuehrt und Ergebnis geschrieben (das URTEIL steht in result.json `ok`, nicht im Exit-Code); 3 Vorbedingung nicht erfuellt (Job: z. B. Head != Branch-Spitze);
+Exit-Codes: 0 Job ausgefuehrt und Ergebnis geschrieben (das URTEIL steht in result.json `ok`, nicht im Exit-Code); 69 Dispatch-Eintrag nicht pruefbar (Datenbank unerreichbar); 3 Vorbedingung nicht erfuellt (Job: z. B. Head != Branch-Spitze);
 4 needs_rebase (Job merge); 64 Job nicht implementiert (Stub); 65 Auftrag abgelehnt; 66 Einheiten-Verzeichnis fehlt/unsicher/Ergebnis liegt schon vor; 70 interner Fehler bzw. Ergebnis nicht schreibbar;
 124 Zeitlimit des Jobs. Jeder andere Job-Exit-Code wird durchgereicht (1..255). Fuer 3/4/64/124 und sonstige Job-Fehler wird ein Ergebnis mit ok=false geschrieben (Beleg), fuer 65/66 nicht.
 stdout = JSON-Zeilen-Log (`{"type":"run-job.finished",...}`, wird zum Run-Log des Watchers); FORGE_RUN_BODY (vom Watcher gesetzt) bekommt den Report-Text (Job + Ausgabe-Ende <= 3000 Bytes).
@@ -162,6 +166,9 @@ def load_repos() -> set[str]:
         return set()                                              # fail closed: ohne Liste ist kein Repo erlaubt
 
 
+SPEC_SHA = [None]                                                 # sha256 der Auftragsdatei (aus denselben gelesenen Bytes wie das geparste JSON) - Grundlage der Autoritaetspruefung
+
+
 def parse_spec(path: str) -> dict:
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW)
@@ -173,6 +180,7 @@ def parse_spec(path: str) -> dict:
         data = f.read(MAX_SPEC + 1)
     if len(data) > MAX_SPEC:
         reject(65, "Auftrag groesser als 64 KB")
+    SPEC_SHA[0] = hashlib.sha256(data).hexdigest()
     try:
         spec = json.loads(data.decode("utf-8"), object_pairs_hook=no_dup, parse_constant=bad_const, parse_float=finite_float)
     except (ValueError, RecursionError):
@@ -234,6 +242,46 @@ def unit_dir(spec: dict) -> str:
         if os.path.lexists(os.path.join(d, name)):
             reject(66, f"{name} liegt in der Einheit schon vor: ein RUN-Auftrag schreibt nie ueber ein vorhandenes Ergebnis")
     return root
+
+
+def order_psql() -> list[str]:
+    raw = os.environ.get("FORGE_RUN_ORDER_PSQL")
+    if raw:
+        try:
+            argv = json.loads(raw)
+        except ValueError:
+            argv = None
+        if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+            reject(69, "FORGE_RUN_ORDER_PSQL ist keine JSON-Liste von Strings")
+        return argv
+    pg = os.environ.get("FORGE_PG_CONTAINER", "forge-postgres-1")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}", pg):
+        reject(69, "FORGE_PG_CONTAINER ungueltig")
+    return ["docker", "exec", "-i", pg, "sh", "-c", 'psql -X -q -At -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d forge']
+
+
+def consume_order(spec: dict, spec_sha: str, path: str) -> None:
+    """ADR-028: den Dispatch-Eintrag des Graphen atomar verbrauchen (published -> running, genau einmal). Alles ausser einer verbrauchten Zeile verweigert den Start ohne Wirkung."""
+    if not spec_sha or not re.fullmatch(r"[0-9a-f]{64}", spec_sha):
+        reject(65, "Auftragsdatei nicht pruefbar (kein sha256)")
+    m = re.search(r"\.n-([0-9a-f]{8})\.md\Z", os.path.basename(path))
+    if not m or m.group(1) != spec["nonce"]:
+        reject(65, "Dateiname traegt nicht den Nonce des Auftrags (Auftrag ist keine Dispatch-Datei des Graphen)")
+    # alle Werte sind hier schon streng validiert (Hex/Zahl) - kein Zeichen, das SQL verlassen koennte
+    sql = (f"UPDATE core.graph_run_orders SET state = 'running', started_at = now() WHERE nonce = '{spec['nonce']}' AND spec_sha256 = '{spec_sha}' "
+           f"AND graph_run_id = {int(spec['graph_run_id'])} AND state = 'published' RETURNING 'consumed';\n")
+    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": os.environ.get("HOME", "/nonexistent"), "LANG": "C"}
+    for k in ("DOCKER_HOST", "DOCKER_CONFIG", "PGPASSWORD", "PGSSLMODE"):
+        if os.environ.get(k):
+            env[k] = os.environ[k]
+    try:
+        p = subprocess.run(order_psql(), input=sql.encode(), capture_output=True, env=env, timeout=45, check=False)
+    except (OSError, subprocess.SubprocessError):
+        reject(69, "Dispatch-Eintrag nicht pruefbar (Datenbankzugang fehlgeschlagen): Auftrag nicht gestartet")
+    if p.returncode != 0:
+        reject(69, "Dispatch-Eintrag nicht pruefbar (psql Exit %d): Auftrag nicht gestartet" % p.returncode)
+    if p.stdout.decode("utf-8", "replace").strip() != "consumed":
+        reject(65, "kein passender, unverbrauchter Dispatch-Eintrag des Graphen (Nonce/graph_run_id/sha256, Zustand published): Auftrag nicht gestartet")
 
 
 def tail_of(path: str, n: int) -> str:
@@ -352,6 +400,7 @@ def main(argv: list[str]) -> None:
         reject(65, "Aufruf: forge-run-job <spec-datei>")
     spec = parse_spec(argv[1])
     root = unit_dir(spec)
+    consume_order(spec, SPEC_SHA[0], argv[1])            # UNMITTELBAR vor dem Start: ohne verbrauchbaren Dispatch-Eintrag keine Wirkung
     started = utcl()
     scratch = tempfile.mkdtemp(prefix="forge-run-job.")
     try:

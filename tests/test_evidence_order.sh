@@ -11,6 +11,7 @@ export FORGE_BASE="$T/base"; POST="$FORGE_BASE/post"; mkdir -p "$POST"/{eingang,
 export HOME="$FORGE_BASE/home" FORGE_MIN_AGE=0 FORGE_POLL=1 FORGE_RUN_REPOS_FILE="$T/repos.list" FORGE_RUN_GATES_FILE="$T/gates.json"
 printf 'fixrepo\n' > "$FORGE_RUN_REPOS_FILE"; echo '{"fixrepo":{"lint":{"argv":["bash","-c","echo ok"]}}}' > "$FORGE_RUN_GATES_FILE"
 umask 0002
+. "$HERE/lib_orders.sh"
 PASS=0; FAIL=0
 ok()  { echo "PASS  $1"; PASS=$((PASS+1)); }
 bad() { echo "FAIL  $1"; FAIL=$((FAIL+1)); }
@@ -40,7 +41,7 @@ fi
 EOF
 chmod +x "$T/$ex"; done
 export CLAUDE_BIN="$T/claude" CODEX_BIN="$T/codex"
-watch() { PATH="$T/fakebin:$PATH" bash "$OPS/bin/forge-postbote.sh" --once >"$T/watcher.out" 2>&1; }
+watch() { autoorder; PATH="$T/fakebin:$PATH" bash "$OPS/bin/forge-postbote.sh" --once >"$T/watcher.out" 2>&1; }
 
 # traces <name>: "E L A R" (eingang, log, archiv, report) eines Schnappschusses als 0/1
 traces() { local d="$1" name="$2" base="${2%.md}" e=0 l=0 a=0 r=0

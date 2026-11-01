@@ -13,6 +13,7 @@ export FORGE_RUN_REPOS_FILE="$T/repos.list" FORGE_RUN_GATES_FILE="$T/gates.json"
 export FORGE_MCP_TOKEN="SECRET-MCP-TOKEN-MUST-NOT-REACH-JOBS" OTEL_EXPORTER_OTLP_ENDPOINT="http://leak.invalid"
 printf 'fixrepo\nforge-core\n' > "$FORGE_RUN_REPOS_FILE"
 umask 0002
+. "$HERE/lib_orders.sh"
 PASS=0; FAIL=0
 ok()  { echo "PASS  $1"; PASS=$((PASS+1)); }
 bad() { echo "FAIL  $1"; FAIL=$((FAIL+1)); }
@@ -38,7 +39,7 @@ EOF
 
 N=0
 newname() { N=$((N+1)); NAME="RUN_forge-t$N.n-$(printf '%08x' $((0xa0000000 + N))).md"; NONCE=$(printf '%08x' $((0xa0000000 + N))); KEY="run:$N"; GID=7; mkdir -p "$POST/graph/$GID/$KEY"; U="$POST/graph/$GID/$KEY"; }
-watch() { bash "$OPS/bin/forge-postbote.sh" --once >"$T/watcher.out" 2>&1; }
+watch() { autoorder; bash "$OPS/bin/forge-postbote.sh" --once >"$T/watcher.out" 2>&1; }
 REPORT() { ls "$POST/ausgang/REPORT_${NAME%.md}_"*.md 2>/dev/null | head -1; }
 hdr() { grep -m1 -E "^(- )?$1: " "$(REPORT)" | sed -E "s/^(- )?$1: //"; }
 logf() { ls "$POST/log/"*"_${NAME%.md}.$1" 2>/dev/null | head -1; }
@@ -248,7 +249,7 @@ echo \$! > "$T/slow.child.pid"
 sleep 300
 EOF
 newname; printf '%s' "$(spec ci-gate "$G1")" > "$POST/eingang/$NAME"
-FORGE_RUN_MAX_SECONDS=2 bash "$OPS/bin/forge-postbote.sh" --once >"$T/watcher.out" 2>&1
+autoorder; FORGE_RUN_MAX_SECONDS=2 bash "$OPS/bin/forge-postbote.sh" --once >"$T/watcher.out" 2>&1
 check "Zeitlimit: Exit-Code 124 im Report"                 test "$(hdr Exit-Code)" = 124
 check "Zeitlimit: Hinweis im Report"                       grep -q 'Zeitlimit' "$(REPORT)"
 sleep 1
@@ -334,8 +335,8 @@ cat > "$PJ/ci-gate" <<EOF
 env | sort > "$T/direct-env.txt"
 printf '{"ok":true}' > "\$FORGE_JOB_OUT/detail.json"
 EOF
-printf '%s' "$(spec ci-gate "$G1")" > "$T/direct-spec.json"
-FORGE_MCP_TOKEN=SECRET-X OTEL_EXPORTER_OTLP_ENDPOINT=http://leak.invalid ANTHROPIC_API_KEY=sk-x python3 "$OPS/bin/forge-run-job" "$T/direct-spec.json" >/dev/null 2>&1
+printf '%s' "$(spec ci-gate "$G1")" > "$T/direct-spec.n-$NONCE.md"; order_file "$T/direct-spec.n-$NONCE.md"
+FORGE_MCP_TOKEN=SECRET-X OTEL_EXPORTER_OTLP_ENDPOINT=http://leak.invalid ANTHROPIC_API_KEY=sk-x python3 "$OPS/bin/forge-run-job" "$T/direct-spec.n-$NONCE.md" >/dev/null 2>&1
 check "forge-run-job direkt: Job-Env ohne MCP/OTEL/ANTHROPIC"                  bash -c "! grep -qi 'SECRET-X\|OTEL\|ANTHROPIC\|leak.invalid' '$T/direct-env.txt' && grep -q '^FORGE_JOB_OUT=' '$T/direct-env.txt'"
 # Watcher -> forge-run-job: nur die feste Variablenliste, nie das Executor-Environment
 cat > "$T/envprobe" <<EOF
@@ -353,7 +354,7 @@ cat > "$T/gates4.json" <<EOF
 {"fixrepo": {"format": {"argv": ["bash", "-c", "echo \$\$ > $T/gate.pid; sleep 313 & echo \$! > $T/gate.child.pid; wait"], "timeout": 600}}}
 EOF
 newname; printf '%s' "$(spec ci-gate "$(CI_ARGS "$HEAD2" '["format"]')")" > "$POST/eingang/$NAME"
-FORGE_RUN_GATES_FILE="$T/gates4.json" FORGE_RUN_MAX_SECONDS=3 bash "$OPS/bin/forge-postbote.sh" --once >"$T/watcher.out" 2>&1
+autoorder; FORGE_RUN_GATES_FILE="$T/gates4.json" FORGE_RUN_MAX_SECONDS=3 bash "$OPS/bin/forge-postbote.sh" --once >"$T/watcher.out" 2>&1
 sleep 1
 check "Zeitlimit mit Gate: Exit 124"                                           test "$(hdr Exit-Code)" = 124
 check "Zeitlimit: Gate-Prozess beendet"                                        bash -c "$(declare -f alive); ! alive \$(cat '$T/gate.pid')"
@@ -371,6 +372,57 @@ check "  ... Hintergrundprozess nach dem Gate beendet"                          
 # Auftrag mit einzelnem Surrogat im Schluessel => 65 (nicht 70), eine Zeile
 N=$((N+1)); NAME="RUN_forge-t$N.n-$(printf '%08x' $((0xa0000000 + N))).md"; printf '{"job":"ci-gate","args":{},"graph_run_id":1,"key":"k","nonce":"a0000001","\\ud800x":1}' > "$POST/eingang/$NAME"; watch
 check "Surrogat im Schluessel => Exit 65 mit einer Zeile"                      bash -c "[ \"$(hdr Exit-Code)\" = 65 ] && [ \"\$(wc -l < '$(logf stderr)')\" = 1 ]"
+
+# ================= 7b. AUTORITAET (ADR-028, S2c rework 1): ohne Dispatch-Eintrag des Graphen startet kein Job =================
+# Probe-Job: legt einen Marker an, wenn er laeuft (Beweis "kein Seiteneffekt")
+export FORGE_RUN_JOBS_DIR="$PJ"
+cat > "$PJ/ci-gate" <<EOF
+#!/usr/bin/env bash
+touch "$T/ran.ci-gate"
+printf '{"ok":true}' > "\$FORGE_JOB_OUT/detail.json"
+EOF
+chmod +x "$PJ/ci-gate"
+direct() { # <name-der-datei-ohne-.md> -> forge-run-job direkt auf eine Auftragsdatei; Exit-Code in $DRC, stderr in $T/direct.err
+  python3 "$OPS/bin/forge-run-job" "$1" >"$T/direct.out" 2>"$T/direct.err"; DRC=$?
+}
+newspec() { newname; SPECFILE="$T/spec.n-$NONCE.md"; printf '%s' "$(spec ci-gate "$G1")" > "$SPECFILE"; }   # Unit-Verzeichnis liegt vor (newname)
+rm -f "$T/ran.ci-gate"
+newspec; direct "$SPECFILE"
+check "Runner: Auftrag OHNE Dispatch-Eintrag => Exit 65, Job nicht gestartet"      bash -c "[ $DRC = 65 ] && [ ! -e '$T/ran.ci-gate' ] && [ ! -e '$U/result.json' ] && [ ! -e '$U/report.md' ]"
+check "  ... Meldung nennt den fehlenden Dispatch-Eintrag"                          grep -q 'Dispatch-Eintrag' "$T/direct.err"
+newspec; order_file "$SPECFILE"; python3 -c "
+import sys;p=sys.argv[1];s=open(p).read();open(p,'w').write(s.replace('\"lint\"','\"tests\"'))" "$SPECFILE"
+direct "$SPECFILE"
+check "Runner: Eintrag mit anderer sha256 (Auftrag nachtraeglich geaendert) => Exit 65" bash -c "[ $DRC = 65 ] && [ ! -e '$T/ran.ci-gate' ] && [ ! -e '$U/result.json' ]"
+newspec; order_file "$SPECFILE" ordered; direct "$SPECFILE"
+check "Runner: Eintrag nur 'ordered' (noch nicht veroeffentlicht) => Exit 65"      bash -c "[ $DRC = 65 ] && [ ! -e '$T/ran.ci-gate' ]"
+newspec; order_file "$SPECFILE" running; direct "$SPECFILE"
+check "Runner: Eintrag schon 'running' (verbraucht) => Exit 65"                     bash -c "[ $DRC = 65 ] && [ ! -e '$T/ran.ci-gate' ]"
+newspec; printf '%s %s %s published\n' "$NONCE" "$(sha256sum "$SPECFILE" | cut -d' ' -f1)" "$((GID+7))" >> "$ORDERS"; direct "$SPECFILE"
+check "Runner: Eintrag gehoert zu einem ANDEREN graph_run_id als der Auftrag => Exit 65" bash -c "[ $DRC = 65 ] && [ ! -e '$T/ran.ci-gate' ]"
+newspec; order_file "$SPECFILE"; cp "$SPECFILE" "$T/other-name.md"; direct "$T/other-name.md"
+check "Runner: Dateiname ohne passenden Nonce => Exit 65 (keine Dispatch-Datei)"    bash -c "[ $DRC = 65 ] && [ ! -e '$T/ran.ci-gate' ]"
+# positiv + genau einmal
+newspec; order_file "$SPECFILE"; rm -f "$T/ran.ci-gate"; direct "$SPECFILE"
+check "Runner: mit Dispatch-Eintrag (published) => Exit 0, Job lief, Ergebnis da"   bash -c "[ $DRC = 0 ] && [ -e '$T/ran.ci-gate' ] && [ -s '$U/result.json' ]"
+check "  ... Eintrag ist jetzt 'running'"                                            grep -q " running\$" <(grep "^$NONCE " "$ORDERS")
+rm -f "$T/ran.ci-gate"; U2="$U"; mv "$U2/result.json" "$U2/result.old"; mv "$U2/report.md" "$U2/report.old"
+direct "$SPECFILE"
+check "Runner: derselbe Nonce ein zweites Mal => Exit 65, Job nicht erneut gestartet" bash -c "[ $DRC = 65 ] && [ ! -e '$T/ran.ci-gate' ] && [ ! -e '$U2/result.json' ]"
+# Datenbank nicht erreichbar => 69, kein Start
+newspec; order_file "$SPECFILE"; rm -f "$T/ran.ci-gate"
+FORGE_RUN_ORDER_PSQL="[\"python3\",\"$OPS/tests/fake-psql\",\"--state\",\"$T/gibt-es-nicht\"]" direct "$SPECFILE"
+check "Runner: Datenbank nicht erreichbar => Exit 69, Job nicht gestartet"           bash -c "[ $DRC = 69 ] && [ ! -e '$T/ran.ci-gate' ]"
+FORGE_RUN_ORDER_PSQL='kein json' direct "$SPECFILE"
+check "Runner: kaputtes FORGE_RUN_ORDER_PSQL => Exit 69"                              test "$DRC" = 69
+FORGE_RUN_ORDER_PSQL='["/gibt/es/nicht"]' direct "$SPECFILE"
+check "Runner: psql nicht ausfuehrbar => Exit 69"                                    test "$DRC" = 69
+# Watcher zuerst (Fremddatei, kein Eintrag): der Watcher greift sie auf, der Runner verweigert; nichts laeuft
+newname; printf '%s' "$(spec ci-gate "$G1")" > "$POST/eingang/$NAME"; rm -f "$T/ran.ci-gate"
+NO_AUTO_ORDER=1 watch
+check "Watcher greift eine Fremd-RUN-Datei VOR dem Importer auf => Report Exit 65, Job nicht gestartet" bash -c "[ \"$(hdr Exit-Code)\" = 65 ] && [ ! -e '$T/ran.ci-gate' ] && [ ! -e '$U/result.json' ]"
+check "  ... Brief archiviert (kein Dauerlauf), Meldung im Run-Log"                  bash -c "ls '$POST/erledigt/'*_'$NAME' >/dev/null && grep -q 'Dispatch-Eintrag' '$(logf stderr)'"
+unset FORGE_RUN_JOBS_DIR
 
 # ================= 8. Stubs: Exit 64, nichts ausgefuehrt =================
 stubcase() { # job args extra

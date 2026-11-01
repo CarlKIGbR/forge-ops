@@ -287,7 +287,7 @@ process() {
     if [ "$art" = RUN ]; then
       # LLM-freier Auftrag: kein Executor-Environment (kein MCP-Token, kein OTEL), leeres Environment mit fester Liste; die Brief-Datei bleibt in eingang/ (W-3) und wird nur als Auftrag gelesen
       local -a renv=(PATH=/usr/local/bin:/usr/bin:/bin HOME="${HOME:-/srv/forge/home}" LANG=C.UTF-8 FORGE_BASE="$BASE" FORGE_RUN_BODY="$body") rv
-      for rv in TMPDIR FORGE_GRAPH_DIR FORGE_RUN_REPOS_FILE FORGE_RUN_JOBS_DIR FORGE_RUN_GATES_FILE FORGE_RUN_WRITE_RESULT; do [ -n "${!rv:-}" ] && renv+=("$rv=${!rv}"); done
+      for rv in TMPDIR DOCKER_HOST DOCKER_CONFIG FORGE_PG_CONTAINER FORGE_RUN_ORDER_PSQL FORGE_GRAPH_DIR FORGE_RUN_REPOS_FILE FORGE_RUN_JOBS_DIR FORGE_RUN_GATES_FILE FORGE_RUN_WRITE_RESULT; do [ -n "${!rv:-}" ] && renv+=("$rv=${!rv}"); done
       ( cd "$WORK" && exec timeout "${FORGE_RUN_MAX_SECONDS:-3900}" env -i "${renv[@]}" "$bin" "$EIN/$name" < /dev/null > "$json" 2> "$err" 9>&- 8>&- ) &
     else
       ( forge_exec_env "$exec" "${ts}_$name" "${k%%-*}" "$k"; cd "$WORK" && exec timeout "${FORGE_MAX_SECONDS:-14400}" "$bin" "${args[@]}" < "$EIN/$name" > "$json" 2> "$err" 9>&- 8>&- ) &

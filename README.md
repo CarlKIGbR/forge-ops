@@ -37,3 +37,8 @@ Aeltere Beschreibung (S2b):
 (`.tmp` O_EXCL -> fsync -> rename -> fsync Verzeichnis). Prueft nur minimal (Groesse, striktes JSON, `schema`, Pflicht-/erlaubte Schluessel, `nonce`/`graph_run_id`/`key`); die inhaltliche Pruefung und alle Identitaetspruefungen gegen den
 Ledger macht der Graph (forge-core `graph/ingest.py`). Exit 0 geschrieben, 2 Aufruf, 3 Datei ungueltig (eine Zeile auf stderr). Das Verzeichnis legt der Graph an. Schluesseltabelle = `forge_core.graph.results.SPEC` (Paritaetstest in forge-core).
 Tests: `tests/test_write_result.sh`. Kein Watcher-Neustart noetig (reines Werkzeug); Installation in den `PATH` der Executoren erst nach Slice-Review.
+
+## RUN-Autoritaet (ADR-028, S2c rework 1)
+`bin/forge-run-job` startet einen Auftrag nur, wenn der Graph ihn bestellt hat: unmittelbar vor dem Start wird der Dispatch-Eintrag (`core.graph_run_orders`: Nonce, graph_run_id, sha256 der Auftragsdatei, Zustand `published`) atomar auf `running` gesetzt
+(`docker exec -i $FORGE_PG_CONTAINER psql ...`, Standard `forge-postgres-1`; Test: `FORGE_RUN_ORDER_PSQL` = JSON-Liste des psql-Aufrufs). Kein Eintrag / andere sha256 / anderer graph_run_id / schon verbraucht => Exit 65, Datenbank nicht erreichbar => Exit 69, jeweils OHNE Wirkung
+(auch wenn der Watcher die Datei vor dem Importer aufgreift). Der Dateiname muss `...n-<nonce>.md` mit dem Nonce des Auftrags tragen. Tests: `tests/test_run_kind.sh` (Abschnitt 7b, mit `tests/fake-psql` als Nachbildung der Verbrauchs-Semantik); die echte DB-Semantik pruefen die Kern-Tests `test_f5c2_s2c_runorders.py`.
