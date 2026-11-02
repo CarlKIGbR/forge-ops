@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Gate `shell_syntax` (ops-eigen, nicht aus dem geprueften Branch): bash -n ueber ALLE getrackten Shell-Skripte des Checkouts (cwd).
+# Aufzaehlung per `git ls-files` (keine Handliste): Endung .sh/.bash ODER Shebang auf bash/sh in der ersten Zeile. Symlinks und Nicht-Dateien werden uebersprungen.
+# Aufruf: shell-syntax [--min N]   (N = Mindestanzahl gefundener Skripte, sonst Exit 1: ein leer laufendes Gate ist nicht gruen)
+# Exit 0 = alle Skripte syntaktisch in Ordnung, 1 = mindestens ein Fehler bzw. zu wenige Skripte, 2 = Aufruf/kein Git-Checkout.
+set -u
+MIN=0
+if [ "${1:-}" = "--min" ]; then MIN="${2:-}"; shift 2; fi
+case "$MIN" in ''|*[!0-9]*) echo "shell-syntax: --min erwartet eine Zahl" >&2; exit 2;; esac
+[ $# -eq 0 ] || { echo "shell-syntax: Aufruf: shell-syntax [--min N]" >&2; exit 2; }
+git rev-parse --show-toplevel >/dev/null 2>&1 || { echo "shell-syntax: kein Git-Checkout im cwd" >&2; exit 2; }
+n=0; bad=0
+while IFS= read -r -d '' f; do
+  [ -f "$f" ] && [ ! -L "$f" ] || continue
+  case "$f" in
+    *.sh|*.bash) ;;
+    *) IFS= read -r first < "$f" 2>/dev/null || true
+       case "$first" in "#!"*[/\ ]bash*|"#!"*[/\ ]sh|"#!"*[/\ ]sh\ *) ;; *) continue;; esac;;
+  esac
+  n=$((n+1))
+  if ! out=$(bash -n -- "$f" 2>&1); then bad=$((bad+1)); echo "SYNTAX FEHLER: $f"; echo "$out" | head -n 5; fi
+done < <(git ls-files -z)
+echo "shell-syntax: $n Skripte geprueft, $bad fehlerhaft"
+[ "$bad" -eq 0 ] && [ "$n" -ge "$MIN" ]

@@ -28,6 +28,19 @@ neu starten (wirkt nur zwischen zwei Runs, nie waehrend einer Einheit), `forge-w
 Tests: `tests/test_run_kind.sh` (Grammatik, Allowlist, jede Argument-Regel, Exit-Mapping, Environment, Zeitlimit, ci-gate, Stubs, G27), `tests/test_evidence_order.sh` (= `test_evidence_order_watcher`, Design W-3 am echten Watcher:
 Schnappschuss vor jedem `mv` + Abtastung; Reihenfolge Log -> Archiv -> Report; fuer Claude/Codex/RUN/ABGELEHNT/Exit 2).
 
+## Gate-Tabelle `etc/ci-gates.json` und `bin/gates/` (F5c Teil 2, Slice S3a)
+Die Tabelle ist ops-eigen (nie aus dem Branch); `ci-gate` ersetzt `{ops}` in `argv` durch dieses forge-ops-Checkout, die Hilfsskripte liegen unter `bin/gates/`. Gates laufen im sauberen Checkout mit leerem Environment
+(`PATH=/usr/local/bin:/usr/bin:/bin`, `HOME`/`TMPDIR` im Wegwerfbereich, `CI=1`), eigener Prozessgruppe und Zeitlimit; ein Gate ohne Eintrag ist `not_configured` = rot.
+- **forge-ops:** `shell_syntax`, `tests` (wie bisher; `shell_syntax` deckt jetzt auch `bin/gates/*` ab).
+- **forge-core:** `shell_syntax` (`bin/gates/shell-syntax --min 1`: `bash -n` ueber alle per `git ls-files` getrackten Shell-Skripte, Endung `.sh`/`.bash` oder Shebang bash/sh), `tests` (`bin/gates/forge-core-tests`,
+  1500 s: baut `forge-core/tests:gate-<head12>` aus dem Checkout mit den Digest-Pins aus dessen `images.lock`, faehrt die volle Suite im Compose-Projekt `forge-core-gate-<head12>` mit `FORGE_OPS_DIR` = dieses
+  Checkout und `FORGE_REQUIRE_OPS=1`, raeumt IMMER auf - Exit, SIGTERM und per abgekoppeltem Waechter auch nach SIGKILL -, fasst nur die eigenen Namen an, reicht den pytest-Exit durch, Ausgabe: letzte 60 Zeilen),
+  `gitleaks` (`bin/gates/gitleaks`, 300 s: lokales, per Image-ID gepinntes Tool-Image `forge-tool-gitleaks:build`, `--network none`, read-only, nur Arbeitsbaum ohne Git-Verlauf, Konfiguration `etc/gitleaks.toml`
+  statt der des Branches, `.gitleaksignore`/`.gitleaks.toml`/`gitleaks:allow` im Branch wirken nicht; Image fehlt => rot).
+- **Bewusst NICHT konfiguriert (=> `not_configured` => rot):** `lint`, `format` (kein Linter auf dem Host, forge-core hat keine Lint-/Format-Konfiguration - kein Fake-Gate), `diff_coverage`, `migration_class` (kein Werkzeug)
+  sowie jedes Gate fuer jedes andere Repo (z. B. `forge-docs`). Zeitlimits: je Gate max. 3600 s, Job-Limit von `ci-gate` 3600 s, `FORGE_RUN_MAX_SECONDS` 3900 s (Summe der konfigurierten forge-core-Gates 1920 s).
+Tests: `tests/test_ci_gates_table.sh` (Tabelle, `shell_syntax` gruen/rot, `gitleaks` am echten lokalen Image, `tests`-Gate mit gestubbtem `docker`: abgeleitete Namen, Aufraeumen bei Exit/SIGTERM/SIGKILL, Exit-Weitergabe).
+
 ## `bin/forge-write-result` (F5c Teil 2, Slice S2b; M-100 in S2c)
 M-100 (Head-Herkunft): `forge-write-result --nonce <8hex> [--worktree <dir>] [--report <datei>] [--exclusive] <gid>/<key> <json>`. Mit `--worktree` uebernimmt das Werkzeug `head_sha`/`branch` (build), `reviewed_head` (review) bzw. `head_sha` (run)
 aus `git rev-parse HEAD` des Worktrees (getrackter Teil muss sauber sein = endgueltiger Commit; ein getippter abweichender Wert => Exit 3 mit beiden Werten) und erzeugt die erste Zeile von `report.md`: `Head: <sha>`.

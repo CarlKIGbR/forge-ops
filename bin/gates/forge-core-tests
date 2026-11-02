@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Gate `tests` fuer forge-core (ops-eigen, NICHT aus dem geprueften Branch): baut das Test-Image aus dem Checkout (cwd) und faehrt die volle pytest-Suite gegen Postgres 17 + pgvector
+# (compose.yaml des Checkouts, Service `tests` + `testdb`, Profil `test`). Aufruf durch ci-gate: cwd = sauberer Checkout, leeres Environment (PATH/HOME/TMPDIR/LANG/CI).
+#
+# Namen aus dem Head des Checkouts (`git rev-parse HEAD`, 12 Hex): Image `forge-core/tests:gate-<h12>`, Compose-Projekt `forge-core-gate-<h12>`. Ein Gate fasst NUR diese Namen an
+# (nie Produktions-Projekte, -Netze, -Volumes, `:build`-/gepinnte Tags oder images.lock). Pins (IMG_PYTHON, IMG_PGVECTOR) kommen aus images.lock DES CHECKOUTS und muessen Digest-Pins sein.
+# FORGE_OPS_DIR = dieses forge-ops-Checkout (aus dem Skriptpfad), FORGE_REQUIRE_OPS=1. Die Env-Datei liegt im Wegwerfverzeichnis ausserhalb des Checkouts; der Checkout bleibt unveraendert
+# (Build-Kontext schreibt nichts, PYTHONDONTWRITEBYTECODE im Image, kein Volume des Checkouts im Test-Container).
+# Aufraeumen IMMER (compose down -v --remove-orphans, Sweep ueber das Projekt-Label, Image entfernen, Wegwerfverzeichnis): beim Beenden, bei SIGTERM/SIGINT/SIGHUP und - falls dieses
+# Skript hart getoetet wird (SIGKILL durch das Gate-Zeitlimit) - durch einen abgekoppelten Waechter (eigene Sitzung), der das Ende des Skripts abwartet. Pytest-Ausgabe: nur die letzten 60 Zeilen.
+# Exit: pytest-Exit (0 gruen), 2 Vorbedingung (kein Checkout, ungueltiger Pin, kein docker), 3 Image-Build fehlgeschlagen.
+# Nebenlaeufigkeit: gleicher Head => gleiche Namen; zwei gleichzeitige Gates fuer denselben Head sind nicht vorgesehen (der Graph fuehrt ein Gate je Head aus).
+set -u
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+OPS="$(dirname "$(dirname "$HERE")")"
+NAME_RE='^forge-core-gate-[0-9a-f]{12}$'
+
+# ---- Aufraeumen (idempotent; fasst nur Ressourcen des Projekts <proj> und das Image <image> an) ----
+sweep() { # proj image tmpdir   (ohne das Wegwerfverzeichnis zu entfernen)
+  local proj="$1" image="$2" tmp="$3" ids
+  [[ "$proj" =~ $NAME_RE ]] || return 0                         # nie mit einem fremden Namen arbeiten
+  [[ "$image" == "forge-core/tests:gate-${proj##*-}" ]] || return 0
+  if [ -s "$tmp/compose.env" ] && [ -f "$tmp/compose.yaml.path" ]; then
+    docker compose -f "$(cat "$tmp/compose.yaml.path")" -p "$proj" --env-file "$tmp/compose.env" --profile test down -v --remove-orphans >/dev/null 2>&1
+  fi
+  ids=$(docker ps -aq --filter "label=com.docker.compose.project=$proj" 2>/dev/null); [ -z "$ids" ] || docker rm -f -v $ids >/dev/null 2>&1
+  ids=$(docker network ls -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null); [ -z "$ids" ] || docker network rm $ids >/dev/null 2>&1
+  ids=$(docker volume ls -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null); [ -z "$ids" ] || docker volume rm -f $ids >/dev/null 2>&1
+  docker rmi "$image" >/dev/null 2>&1
+  return 0
+}
+teardown() { sweep "$@"; case "$3" in */forge-gate.*) rm -rf "$3";; esac; return 0; }
+case "${1:-}" in
+  __teardown) teardown "$2" "$3" "$4"; exit 0;;
+  __reap)     # Waechter: wartet auf das Ende von Skript <pid>; ist das Wegwerfverzeichnis dann noch da, wurde nicht regulaer aufgeraeumt
+    while kill -0 "$2" 2>/dev/null; do sleep 1; done
+    [ -d "$5" ] && teardown "$3" "$4" "$5"; exit 0;;
+esac
+
+die() { echo "forge-core-tests: $*" >&2; exit "${2:-2}"; }
+command -v docker >/dev/null 2>&1 || die "docker nicht im PATH"
+HEAD="$(git rev-parse --verify -q 'HEAD^{commit}' 2>/dev/null)" || die "kein Git-Checkout im cwd"
+H12="${HEAD:0:12}"
+CHECKOUT="$(pwd -P)"
+[ -f compose.yaml ] && [ -f Dockerfile ] && [ -f images.lock ] || die "compose.yaml/Dockerfile/images.lock fehlen im Checkout"
+PROJ="forge-core-gate-$H12"; IMAGE="forge-core/tests:gate-$H12"
+[[ "$PROJ" =~ $NAME_RE ]] || die "ungueltiger Projektname"
+pin() { local v; v=$(grep -E "^$1=" images.lock | tail -n 1 | cut -d= -f2-); [[ "$v" =~ ^[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}$ ]] || die "images.lock: $1 fehlt oder ist kein Digest-Pin"; echo "$v"; }
+IMG_PYTHON="$(pin IMG_PYTHON)" || exit 2
+IMG_PGVECTOR="$(pin IMG_PGVECTOR)" || exit 2
+
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/forge-gate.XXXXXX")" || die "kein Wegwerfverzeichnis"
+case "$TMP" in "$CHECKOUT"/*) die "Wegwerfverzeichnis liegt im Checkout";; esac
+BG=""
+cleanup() { rc=$?; trap '' TERM INT HUP; [ -z "$BG" ] || kill "$BG" 2>/dev/null; setsid -w "$HERE/$(basename "${BASH_SOURCE[0]}")" __teardown "$PROJ" "$IMAGE" "$TMP"; exit "$rc"; }
+trap cleanup EXIT; trap 'exit 143' TERM INT HUP
+
+# Env-Datei: alle IMG_*-Pins des Checkouts (images.lock), danach die Gate-Werte (das Prozess-Environment unten hat zusaetzlich Vorrang)
+{ grep -E '^IMG_[A-Z0-9_]+=[^[:space:]]*$' images.lock
+  echo "FORGE_UID=$(id -u)"; echo "FORGE_GID=$(id -g)"
+  echo "FORGE_TESTS_IMAGE=$IMAGE"; echo "FORGE_OPS_DIR=$OPS"; echo "FORGE_REQUIRE_OPS=1"
+} > "$TMP/compose.env"
+printf '%s' "$CHECKOUT/compose.yaml" > "$TMP/compose.yaml.path"
+export FORGE_TESTS_IMAGE="$IMAGE" FORGE_OPS_DIR="$OPS" FORGE_REQUIRE_OPS=1 FORGE_UID="$(id -u)" FORGE_GID="$(id -g)" IMG_PYTHON IMG_PGVECTOR
+CT() { docker compose -f "$CHECKOUT/compose.yaml" --project-directory "$CHECKOUT" -p "$PROJ" --env-file "$TMP/compose.env" --profile test "$@"; }
+
+# Waechter (eigene Sitzung, stdin/stdout/stderr frei vom Gate): raeumt auch nach SIGKILL dieses Skripts auf
+setsid "$HERE/$(basename "${BASH_SOURCE[0]}")" __reap "$$" "$PROJ" "$IMAGE" "$TMP" </dev/null >/dev/null 2>&1 &
+echo "forge-core-tests: head=$HEAD image=$IMAGE project=$PROJ ops=$OPS"
+sweep "$PROJ" "$IMAGE" "$TMP"                                   # Reste eines frueheren, hart beendeten Laufs desselben Heads
+
+# ---- Build ----
+docker build --pull=false --target test --build-arg "BASE_IMAGE=$IMG_PYTHON" --build-arg "PG_IMAGE=$IMG_PGVECTOR" -t "$IMAGE" -f Dockerfile . >"$TMP/build.log" 2>&1 &
+BG=$!; wait "$BG"; brc=$?; BG=""
+if [ "$brc" -ne 0 ]; then echo "forge-core-tests: Image-Build fehlgeschlagen (Exit $brc), Ende des Build-Logs:"; tail -n 40 "$TMP/build.log" | cut -c1-300; exit 3; fi
+
+# ---- Suite ----
+CT run --rm -T tests python -m pytest -p no:cacheprovider -q >"$TMP/pytest.log" 2>&1 &
+BG=$!; wait "$BG"; rc=$?; BG=""
+tail -n 60 "$TMP/pytest.log" | cut -c1-300
+echo "forge-core-tests: pytest-Exit $rc (head=$HEAD)"
+exit "$rc"

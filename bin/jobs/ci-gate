@@ -10,7 +10,8 @@ Ablauf (jeder Schritt liest den Zustand frisch, G28):
      Befehle laufen mit leerem Environment, eigener Prozessgruppe, Zeitlimit; ein Gate, das getrackte Dateien veraendert, ist rot (`tree_modified`) und der Checkout wird zurueckgesetzt
   4. detail.json (Urteil `ok` = alle Gates gruen, Gate-Liste, Spitze am Anfang und am Ende) + report.txt + head_worktree (der Checkout: forge-run-job laesst den Head von forge-write-result aus git
      uebernehmen - M-100, der Head im Ergebnis ist nie getippt)
-Exit 0 = Gates gelaufen (Urteil in detail.json), 3 = Vorbedingung verletzt. Gate-Tabelle: {"<repo>|*": {"<gate>": {"argv": [...], "timeout": <s>}}}."""
+Exit 0 = Gates gelaufen (Urteil in detail.json), 3 = Vorbedingung verletzt. Gate-Tabelle: {"<repo>|*": {"<gate>": {"argv": [...], "timeout": <s>}}}; in argv wird "{ops}" durch das Wurzelverzeichnis dieses forge-ops-Checkouts ersetzt (ops-eigene Hilfsskripte unter bin/gates/).
+Environment der Gates (genau das, nichts sonst): PATH=/usr/local/bin:/usr/bin:/bin, HOME=<scratch>/home, TMPDIR=<scratch>/home/tmp, LANG=LC_ALL=C.UTF-8, CI=1; cwd = der Checkout; stdin /dev/null."""
 import hashlib
 import json
 import os
@@ -102,6 +103,7 @@ def run_gate(name, spec, cwd, home, logpath):
     argv = spec.get("argv")
     if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
         return {"name": name, "status": "error", "reason": "bad_gate_table", "exit": None, "seconds": 0.0}
+    argv = [a.replace("{ops}", OPS) for a in argv]                  # {ops} = dieses forge-ops-Checkout (Gate-Skripte liegen in forge-ops, NICHT im geprueften Branch)
     timeout = spec.get("timeout") if isinstance(spec.get("timeout"), int) and not isinstance(spec.get("timeout"), bool) and 1 <= spec["timeout"] <= 3600 else DEFAULT_TIMEOUT
     env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": home, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "CI": "1", "TMPDIR": os.path.join(home, "tmp")}
     t0 = time.monotonic()

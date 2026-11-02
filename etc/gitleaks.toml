@@ -1,0 +1,21 @@
+# Ops-eigene gitleaks-Konfiguration fuer das Gate `gitleaks` (bin/gates/gitleaks): Standard-Regelwerk. Wird per --config erzwungen, damit eine .gitleaks.toml im geprueften Branch
+# das Gate nicht abschwaechen kann.
+[extend]
+useDefault = true
+
+# Pfade absolut im Container (das Gate mountet die Kopie des Arbeitsbaums nach /src). Freigabe NUR dieser Dateien (Stand forge-core f5c/s3a, einzeln geprueft): absichtlich synthetische Geheimnisse der Redaktions-/Secret-Tests (Fixtures, die genau diese Muster ausloesen
+# muessen) sowie ein Fehlalarm in Fliesstext eines Berichts. Neue Funde in anderen Dateien bleiben rot; eine neue Test-Fixture mit solchem Muster muss hier bewusst ergaenzt werden (Ops-Entscheidung).
+[[allowlists]]
+description = "synthetische Test-Fixtures (Redaktion/Secret-Slots/Tool-Ausgabe) und Fehlalarm in docs/reports/S1_REPORT.md"
+paths = [
+  '''^/src/tests/fixtures/leak/config\.py$''',
+  '''^/src/tests/test_f4_rd_redact\.py$''',
+  '''^/src/tests/test_f4b_runner\.py$''',
+  '''^/src/tests/test_f4b_sandbox\.py$''',
+  '''^/src/tests/test_f4c_redact_ingest\.py$''',
+  '''^/src/tests/test_f4cr_r3_redact\.py$''',
+  '''^/src/tests/test_f5a_secret_slots\.py$''',
+  '''^/src/tests/test_f5c2_s2b_errclass\.py$''',
+  '''^/src/tests/test_m58_tool_output\.py$''',
+  '''^/src/docs/reports/S1_REPORT\.md$''',
+]

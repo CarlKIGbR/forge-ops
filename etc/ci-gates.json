@@ -1,7 +1,12 @@
 {
-  "_comment": "Gate-Tabelle des RUN-Jobs ci-gate (ops-eigen, NICHT aus dem Branch). Schluessel: Repo-Name oder '*'. Gate -> {argv, timeout}. Fehlender Eintrag => not_configured => rot (fail closed). Welche Gates ein Profil verlangt, entscheidet der Graph (S3a); hier steht nur, WIE ein Gate ausgefuehrt wird.",
+  "_comment": "Gate-Tabelle des RUN-Jobs ci-gate (ops-eigen, NICHT aus dem Branch). Schluessel: Repo-Name oder '*'. Gate -> {argv, timeout}. Fehlender Eintrag => not_configured => rot (fail closed). Welche Gates ein Profil verlangt, entscheidet der Graph (S3a); hier steht nur, WIE ein Gate ausgefuehrt wird. In argv ersetzt ci-gate '{ops}' durch dieses forge-ops-Checkout; Gate-Skripte liegen unter bin/gates/ (ops-eigen, nie im geprueften Branch). Gates laufen mit leerem Environment (PATH=/usr/local/bin:/usr/bin:/bin, HOME/TMPDIR im Wegwerfbereich, CI=1), cwd = sauberer Checkout. forge-ops: shell_syntax, tests. forge-core: shell_syntax (bash -n ueber alle getrackten Shell-Skripte, mindestens eines), tests (volle pytest-Suite im Docker-Compose-Projekt forge-core-gate-<head12>, Image forge-core/tests:gate-<head12>, Aufraeumen immer; Zeitlimit 1500 s = Build (Cache) + Suite (~6 min) + Reserve, Obergrenze der Laufzeit je Gate ist 3600 s und das Job-Limit von ci-gate 3600 s), gitleaks (gepinntes lokales Tool-Image, offline, nur Arbeitsbaum, Konfiguration aus etc/gitleaks.toml). BEWUSST NICHT konfiguriert (=> not_configured => rot, fail closed): lint und format (kein Linter auf dem Host, forge-core hat keine Lint-/Format-Konfiguration), diff_coverage, migration_class (kein Werkzeug), sowie alle Gates fuer jedes andere Repo (z. B. forge-docs).",
   "forge-ops": {
-    "shell_syntax": {"argv": ["bash", "-c", "set -e; for f in bin/*.sh tests/*.sh bin/jobs/merge bin/jobs/lock-set bin/jobs/deploy-check bin/jobs/deploy-stage bin/jobs/acceptance; do bash -n \"$f\"; done"], "timeout": 120},
+    "shell_syntax": {"argv": ["bash", "-c", "set -e; for f in bin/*.sh bin/gates/* tests/*.sh bin/jobs/merge bin/jobs/lock-set bin/jobs/deploy-check bin/jobs/deploy-stage bin/jobs/acceptance; do bash -n \"$f\"; done"], "timeout": 120},
     "tests": {"argv": ["bash", "tests/test_write_result.sh"], "timeout": 600}
+  },
+  "forge-core": {
+    "shell_syntax": {"argv": ["bash", "{ops}/bin/gates/shell-syntax", "--min", "1"], "timeout": 120},
+    "gitleaks": {"argv": ["bash", "{ops}/bin/gates/gitleaks"], "timeout": 300},
+    "tests": {"argv": ["bash", "{ops}/bin/gates/forge-core-tests"], "timeout": 1500}
   }
 }

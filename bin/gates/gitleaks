@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Gate `gitleaks` (ops-eigen, nicht aus dem geprueften Branch): Secret-Scan des Arbeitsbaums im cwd (Checkout) mit dem lokal vorhandenen, per Image-ID gepinnten Tool-Image
+# (forge-core registry/images/gitleaks, `gitleaks dir`, wie das Werkzeug gitleaks_scan). Offline: --network none, Wurzel read-only, Checkout nur lesend (:ro), alle Capabilities weg.
+# Nur der Arbeitsbaum, KEIN Git-Verlauf (das Image hat kein git). Konfiguration/Ignore-Regeln kommen aus dem Ops-Checkout (etc/gitleaks.toml), nie aus dem Branch:
+# --config erzwingt das Standard-Regelwerk, --ignore-gitleaks-allow ignoriert Inline-Freigaben. gitleaks liest ein .gitleaksignore (Fingerprint-Freigaben) UND eine .gitleaks.toml
+# trotzdem aus dem Scan-Verzeichnis (beobachtet: --gitleaks-ignore-path hilft nicht) - deshalb scannt das Gate eine Kopie aller getrackten Dateien (git ls-files, ohne Wurzel-
+# .gitleaksignore/.gitleaks.toml) in einem Wegwerfverzeichnis ausserhalb des Checkouts; so kann der Branch seine Funde nicht selbst freigeben.
+# Fail closed: Image fehlt => Exit 4; Exit 0 nur, wenn gitleaks selbst 0 meldet UND mindestens eine Datei im Baum liegt.
+# Ausgabe: Befunde maskiert (--redact), je Fund eine Zeile "Regel Datei:Zeile", begrenzt auf 50 Zeilen. Exit 0 = keine Funde, 1 = Funde, 2 = Aufruf/Vorbedingung, 4 = Image fehlt, sonst gitleaks/docker-Exit.
+set -u
+OPS="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+IMAGE="${FORGE_GATE_GITLEAKS_IMAGE:-sha256:e08827d8f64f381ad7120578e30acbd9706caabc56d5f29fe03afbd9077d3b5c}"     # = images.lock IMG_TOOL_GITLEAKS (forge-tool-gitleaks:build); Ops-Pin, Override nur fuer Tests
+git rev-parse --show-toplevel >/dev/null 2>&1 || { echo "gitleaks-gate: kein Git-Checkout im cwd" >&2; exit 2; }
+[ -n "$(git ls-files | head -n 1)" ] || { echo "gitleaks-gate: leerer Checkout, nichts zu scannen" >&2; exit 2; }
+[ -r "$OPS/etc/gitleaks.toml" ] || { echo "gitleaks-gate: $OPS/etc/gitleaks.toml fehlt" >&2; exit 2; }
+docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "gitleaks-gate: Tool-Image $IMAGE lokal nicht vorhanden (kein Pull, offline) - nicht gruen" >&2; exit 4; }
+HEAD12="$(git rev-parse HEAD 2>/dev/null | cut -c1-12)"
+NAME="forge-core-gate-gitleaks-${HEAD12:-nohead}-$$"
+TMPD="$(mktemp -d)"; LOG="$TMPD/out.log"; mkdir "$TMPD/src" "$TMPD/out"
+trap 'docker rm -f "$NAME" >/dev/null 2>&1; rm -rf "$TMPD"' EXIT; trap 'exit 143' TERM INT HUP
+( set -o pipefail; git ls-files -z | grep -zvxF -e '.gitleaksignore' -e '.gitleaks.toml' | tar --null --no-recursion -T - -cf - | tar -x -C "$TMPD/src" ) || { echo "gitleaks-gate: Kopie des Arbeitsbaums fehlgeschlagen" >&2; exit 2; }
+docker run --rm --name "$NAME" --network none --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges --pids-limit 128 --memory 512m --cpus 1 \
+  --user "$(id -u):$(id -g)" -v "$TMPD/src:/src:ro" -v "$TMPD/out:/out" -v "$OPS/etc/gitleaks.toml:/cfg/gitleaks.toml:ro" \
+  "$IMAGE" gitleaks dir --no-banner --no-color --redact --exit-code 1 --ignore-gitleaks-allow --config /cfg/gitleaks.toml --report-format json --report-path /out/report.json /src >"$LOG" 2>&1
+rc=$?
+tail -n 8 "$LOG" | cut -c1-300
+[ ! -s "$TMPD/out/report.json" ] || python3 -I -c 'import json,sys
+for f in json.load(open(sys.argv[1]))[:50]: print("  %s %s:%s" % (f["RuleID"], f["File"].replace("/src/", "", 1), f["StartLine"]))' "$TMPD/out/report.json" 2>&1 | head -n 50
+echo "gitleaks-gate: Exit $rc"
+exit "$rc"
