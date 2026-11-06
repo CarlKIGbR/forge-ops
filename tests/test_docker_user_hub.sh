@@ -51,6 +51,15 @@ check "dry-run (Edge) unveraendert: 8 Regeln, kein 8094"          bash -c "[ \$(
 check "dry-run (Edge): Timer-Prefix/-Aufruf unveraendert"          bash -c "printf '%s\n' \"\$1\" | grep -q 'systemd-run --unit=forge-docker-user-rollback-<zeit>-<pid> --on-active=300s .*forge-docker-user.sh --remove\$'" _ "$eo"
 check "--hub --install-unit wird abgelehnt (Exit 2)"               bash -c '"$1" --hub --install-unit >/dev/null 2>&1; [ $? = 2 ]' _ "$FW"
 
+# --- Owner-Ablauf 13.B (N5-prep): --dry-run --hub zeigt nur an, aendert nichts, startet keinen Timer ---
+reset
+"$FW" --dry-run --hub >/dev/null 2>&1; r1=$?; "$FW" --dry-run --confirm --hub >/dev/null 2>&1; r2=$?; "$FW" --dry-run --remove --hub >/dev/null 2>&1; r3=$?; "$FW" --dry-run --restore --hub >/dev/null 2>&1; r4=$?
+check "dry-run --hub (apply/confirm/remove/restore): Exit 0, keine Mutation, kein Timer, keine Marke" bash -c "[ $r1$r2$r3$r4 = 0000 ] && ! grep -qE '^(MUT|ARM) ' '$LOG' && [ -z \"\$(ls '$STATE')\" ]"
+check "Standard-Rollback-Timer des Hub-Satzes sind 5 Minuten (300 s)" bash -c "'$FW' --dry-run --hub | grep -q -- '--on-active=300s'"
+reset
+"$FW" --dry-run --hub >/dev/null 2>&1; "$FW" --hub >/dev/null 2>&1
+check "Ablauf 13.B: ein Hub-Apply setzt keine Bestaetigungsmarke (erst --confirm --hub)" test ! -e "$STATE/hub-rules-confirmed"
+
 # --- Apply: Rollback zuerst, nur Hub-Regeln ---
 reset
 "$FW" --hub >/dev/null 2>&1; rc=$?
