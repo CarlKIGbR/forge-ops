@@ -11,7 +11,8 @@
 #   Zusatz --hub (apply/--confirm/--remove/--restore/--dry-run): eigener Regelsatz fuer den forge-nodehub (N1, FORGE_NODE.md 5.1): TCP/8094 auf
 #                                           192.168.10.4 nur aus 192.168.10.0/29 und 192.168.30.0/29 (NICHT aus dem VPN 10.200.0.0/29), sonst DROP.
 #                                           Eigener Tag (forge-nodehub), eigener Rollback-Timer-Prefix, eigene "bestaetigt"-Marke; die Edge-Regeln bleiben unberuehrt.
-#                                           Ein normales --restore (Boot) stellt die Hub-Regeln mit wieder her, wenn sie bestaetigt wurden.
+#                                           Ein normales --restore (Boot) stellt die Hub-Regeln mit wieder her, wenn sie bestaetigt wurden - aber nur, wenn die Boot-Kopie
+#                                           ($SBIN_COPY, von forge-docker-user.service ausgefuehrt) dieses Script ist: --hub und --hub --confirm brechen sonst ab (sudo $SELF --install-unit).
 #
 # Erlaubt 10.200.0.0/29, 192.168.10.0/29, 192.168.30.0/29 auf 192.168.10.4:443 und :8443, alles andere
 # auf diese Ziele wird verworfen. Andere Ports, ufw und andere Chains bleiben unberuehrt.
@@ -54,7 +55,7 @@ for a in "$@"; do
         --restore) mode=restore ;;
         --install-unit) mode=install ;;
         --dry-run) dry=1 ;;
-        -h|--help) sed -n '2,24p' "$SELF"; exit 0 ;;
+        -h|--help) sed -n "2,26p" "$SELF"; exit 0 ;;
         *) echo "unbekannte Option: $a" >&2; exit 2 ;;
     esac
 done
@@ -136,6 +137,14 @@ need_root() {
     fi
 }
 
+# Hub-Satz und Boot: die Unit forge-docker-user.service fuehrt die ROOT-Kopie $SBIN_COPY aus (--restore). Ist sie aelter als dieses Script (kein --hub), kommen die 8094-Regeln nach einem
+# Reboot nicht zurueck und der Hub-Port ist aus jedem Netz erreichbar. Darum setzt/bestaetigt --hub nur, wenn die Boot-Kopie mit diesem Script identisch ist (sudo $SELF --install-unit).
+boot_copy_current() { cmp -s "$SELF" "$SBIN_COPY"; }
+require_boot_copy() {
+    [ "$hub" = 1 ] || return 0
+    boot_copy_current || { echo "Boot-Kopie $SBIN_COPY fehlt oder ist nicht identisch mit $SELF - erst: sudo $SELF --install-unit (sonst fehlen die Hub-Regeln nach einem Reboot). Keine Regel geaendert." >&2; exit 1; }
+}
+
 check_env() {
     $IPT -n -L "$CHAIN" >/dev/null 2>&1 || { echo "Chain $CHAIN fehlt (laeuft Docker?)" >&2; exit 1; }
 }
@@ -162,6 +171,7 @@ case "$mode" in
     apply)
         need_root "$@"
         if [ "$dry" = 1 ]; then
+            [ "$hub" = 0 ] || { boot_copy_current && echo "# 0. Boot-Kopie $SBIN_COPY ist identisch mit diesem Script: ok" || echo "# 0. WARNUNG: Boot-Kopie $SBIN_COPY fehlt/ist anders - der echte Aufruf bricht ab; erst sudo $SELF --install-unit"; }
             echo "# 1. Rollback-Timer (${ROLLBACK_SECONDS} s) anlegen und pruefen - vor jeder Regel-Aenderung; sonst Abbruch ohne Aenderung:"
             echo "systemd-run --unit=$UNIT_PREFIX-<zeit>-<pid> --on-active=${ROLLBACK_SECONDS}s $SELF --remove$SET_ARG"
             echo "# 2. vorhandene $TAG-Regeln werden zuerst entfernt (idempotent, iptables -C/-D je Regel)"
@@ -169,6 +179,7 @@ case "$mode" in
             insert_rules
             exit 0
         fi
+        require_boot_copy
         check_env
         command -v systemd-run >/dev/null || { echo "systemd-run fehlt - ohne Rollback-Timer keine Regeln" >&2; exit 1; }
         ARMED_UNIT=""
@@ -194,10 +205,12 @@ case "$mode" in
     confirm)
         need_root "$@"
         if [ "$dry" = 1 ]; then
+            [ "$hub" = 0 ] || { boot_copy_current && echo "# Boot-Kopie $SBIN_COPY ist identisch: ok" || echo "# WARNUNG: Boot-Kopie $SBIN_COPY fehlt/ist anders - der echte Aufruf bricht ab; erst sudo $SELF --install-unit"; }
             echo "systemctl stop '$UNIT_PREFIX-*.timer'"
             echo "mkdir -p $STATE_DIR && touch $CONFIRMED"
             exit 0
         fi
+        require_boot_copy
         # nur bestaetigen, wenn die Regeln wirklich da sind
         [ -n "$($IPT -S "$CHAIN" 2>/dev/null | grep -- "--comment $TAG" || true)" ] || { echo "keine $TAG-Regeln aktiv - nichts zu bestaetigen" >&2; exit 1; }
         stop_timers
@@ -225,7 +238,7 @@ case "$mode" in
         # Docker veroeffentlicht 8094 am Hub-Container am Host-Filter vorbei; ohne diese Regeln waere der Port aus jedem Netz erreichbar.
         if [ "$hub" = 0 ] && [ -e "$HUB_CONFIRMED" ]; then
             hubargs=(--restore --hub); [ "$dry" = 1 ] && hubargs+=(--dry-run)
-            "$SELF" "${hubargs[@]}" || echo "Hub-Regeln konnten nicht wiederhergestellt werden - Hub bleibt gesperrt (Port 8094 pruefen!)" >&2
+            "$SELF" "${hubargs[@]}" || echo "Hub-Regeln konnten nicht wiederhergestellt werden - Port 8094 ist OFFEN (Docker veroeffentlicht am Host-Filter vorbei), sofort pruefen!" >&2
         fi
         if [ "$dry" = 1 ]; then
             echo "# nur wenn $CONFIRMED existiert:"

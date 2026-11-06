@@ -59,5 +59,8 @@ Tests: `tests/test_write_result.sh`. Kein Watcher-Neustart noetig (reines Werkze
 ## DOCKER-USER fuer den forge-nodehub (N1)
 `bin/forge-docker-user.sh --hub` verwaltet einen zweiten, unabhaengigen Regelsatz: TCP/8094 auf 192.168.10.4 nur aus 192.168.10.0/29 und 192.168.30.0/29 (nicht aus dem VPN 10.200.0.0/29), sonst DROP
 (forge-node Design 5.1). Eigener Tag `forge-nodehub`, eigener Rollback-Timer-Prefix, eigene Marke `hub-rules-confirmed`; die Edge-Regeln (443/8443) bleiben unveraendert. Ablauf wie beim Edge:
-`sudo forge-docker-user.sh --hub` (Timer 300 s) -> Verbindung pruefen -> `sudo forge-docker-user.sh --confirm --hub`. Ein normales `--restore` (Boot) stellt bestaetigte Hub-Regeln mit her.
+`sudo forge-docker-user.sh --hub` (Timer 300 s) -> Verbindung pruefen -> `sudo forge-docker-user.sh --confirm --hub`. Ein normales `--restore` (Boot) stellt bestaetigte Hub-Regeln mit her - **aber die Unit `forge-docker-user.service` fuehrt die Root-Kopie `/usr/local/sbin/forge-docker-user.sh` aus, nicht das Repo-Script**:
+nach dem Merge muss einmal `sudo <repo>/bin/forge-docker-user.sh --install-unit` laufen (ersetzt die Kopie; Edge-Regeln und -Marke bleiben unberuehrt, nichts wird gestartet). `--hub` und `--confirm --hub` brechen ohne identische
+Boot-Kopie ab (Exit 1, keine Regel, keine Marke), damit der Hub-Port nach einem Reboot nie offen zurueckkommt. Pruefung: `sudo /usr/local/sbin/forge-docker-user.sh --dry-run --restore | grep -c forge-nodehub` = 3 (nach `--confirm --hub`).
+Bekanntes Restfenster: beim Boot startet Docker den Hub (`restart: unless-stopped`) vor der Unit; die 8094-Regeln folgen Sekunden spaeter. Fehlschlag des Hub-Restore: Port 8094 ist dann OFFEN (nur mTLS davor) - die Unit meldet es auf stderr.
 Nichts davon ist installiert oder angewendet (N1 liefert Code + Tests). Tests: `tests/test_docker_user_hub.sh`.

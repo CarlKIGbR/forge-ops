@@ -25,12 +25,16 @@ case "\$n" in
 esac
 EOF
 chmod +x "$BIN/stub"; for n in iptables systemd-run systemctl; do ln -s stub "$BIN/$n"; done
-export PATH="$BIN:$PATH" FORGE_FW_TEST=1 FORGE_FW_STATE_DIR="$STATE"
+# Boot-Kopie (forge-docker-user.service fuehrt /usr/local/sbin/forge-docker-user.sh --restore aus): im Test ein Temp-Verzeichnis, nie das echte /usr/local/sbin
+SBIN="$T/sbin"; UDST="$T/units"; USRC="$T/unitsrc"; mkdir -p "$SBIN" "$UDST" "$USRC"
+printf '[Service]\nExecStart=/usr/local/sbin/forge-docker-user.sh --restore\n' > "$USRC/forge-docker-user.service"; printf '[Service]\nExecStart=/bin/true\n' > "$USRC/forge-edge.service"
+export PATH="$BIN:$PATH" FORGE_FW_TEST=1 FORGE_FW_STATE_DIR="$STATE" FORGE_FW_SBIN="$SBIN" FORGE_FW_UNIT_DST="$UDST" FORGE_EDGE_UNIT_SRC="$USRC"
 PASS=0; FAIL=0
 ok()  { echo "PASS  $1"; PASS=$((PASS+1)); }
 bad() { echo "FAIL  $1"; FAIL=$((FAIL+1)); }
 check() { local n="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$n"; else bad "$n"; fi; }
 reset() { : > "$LOG"; rm -f "$STATE"/*; }
+install_boot_copy() { "$FW" --install-unit >/dev/null 2>&1; }
 muts() { grep -c "^MUT iptables $1" "$LOG"; }
 
 # --- Regelsatz (Dry-Run) ---
@@ -59,6 +63,40 @@ check "Standard-Rollback-Timer des Hub-Satzes sind 5 Minuten (300 s)" bash -c "'
 reset
 "$FW" --dry-run --hub >/dev/null 2>&1; "$FW" --hub >/dev/null 2>&1
 check "Ablauf 13.B: ein Hub-Apply setzt keine Bestaetigungsmarke (erst --confirm --hub)" test ! -e "$STATE/hub-rules-confirmed"
+
+# --- Boot-Kopie (Verify M-1): --hub setzt/bestaetigt nur, wenn die Root-Kopie dieses Script ist; sonst fehlen die 8094-Regeln nach dem Reboot ---
+reset; rm -f "$SBIN"/*
+"$FW" --hub >/dev/null 2>&1; rc=$?
+check "apply --hub ohne Boot-Kopie: Exit 1, kein Timer, keine Regel"        bash -c "[ $rc = 1 ] && ! grep -qE '^(MUT|ARM) ' '$LOG'"
+out=$("$FW" --hub 2>&1 >/dev/null); check "apply --hub ohne Boot-Kopie: Meldung nennt --install-unit" bash -c "printf '%s' \"\$1\" | grep -q -- '--install-unit'" _ "$out"
+printf '#!/bin/sh\necho alt\n' > "$SBIN/forge-docker-user.sh"; chmod +x "$SBIN/forge-docker-user.sh"; reset
+"$FW" --hub >/dev/null 2>&1; rc=$?
+check "apply --hub mit veralteter Boot-Kopie: Exit 1, keine Regel"          bash -c "[ $rc = 1 ] && ! grep -qE '^(MUT|ARM) ' '$LOG'"
+STUB_S_LISTS=1 "$FW" --confirm --hub >/dev/null 2>&1; rc=$?
+check "confirm --hub mit veralteter Boot-Kopie: Exit 1, keine Marke"        bash -c "[ $rc = 1 ] && [ ! -e '$STATE/hub-rules-confirmed' ]"
+check "dry-run --hub mit veralteter Boot-Kopie: WARNUNG, Exit 0, keine Mutation" bash -c "o=\$('$FW' --dry-run --hub); [ \$? = 0 ] && printf '%s' \"\$o\" | grep -q WARNUNG && ! grep -qE '^(MUT|ARM) ' '$LOG'"
+if git -C "$HERE/.." cat-file -e 77df871:bin/forge-docker-user.sh 2>/dev/null; then       # die echte Altlast: das Script von master vor dem --hub-Satz als Boot-Kopie
+    git -C "$HERE/.." show 77df871:bin/forge-docker-user.sh > "$SBIN/forge-docker-user.sh"; chmod +x "$SBIN/forge-docker-user.sh"; reset; touch "$STATE/rules-confirmed" "$STATE/hub-rules-confirmed"
+    "$SBIN/forge-docker-user.sh" --restore >/dev/null 2>&1
+    check "Altlast (master-Script als Boot-Kopie): --restore stellt 0 Hub-Regeln her (so war der Reboot-Befund)" bash -c "[ \$(grep -c '^MUT iptables -I.*forge-nodehub' '$LOG') = 0 ]"
+    "$FW" --hub >/dev/null 2>&1; rc=$?
+    check "... und --hub verweigert genau dann"                              test "$rc" = 1
+fi
+reset; "$FW" --install-unit >/dev/null 2>&1; rc=$?
+check "--install-unit: Exit 0, Boot-Kopie identisch, Unit installiert"       bash -c "[ $rc = 0 ] && cmp -s '$FW' '$SBIN/forge-docker-user.sh' && [ -f '$UDST/forge-docker-user.service' ]"
+check "Boot-Unit fuehrt genau die Root-Kopie mit --restore aus"             grep -q "^ExecStart=/usr/local/sbin/forge-docker-user.sh --restore\$" "$UDST/forge-docker-user.service"
+REALUNIT=/srv/forge/work/forge-edge/systemd/forge-docker-user.service
+[ -f "$REALUNIT" ] && check "echte forge-edge-Unit: ExecStart = /usr/local/sbin/forge-docker-user.sh --restore" grep -q "^ExecStart=/usr/local/sbin/forge-docker-user.sh --restore\$" "$REALUNIT"
+check "dry-run --hub mit aktueller Boot-Kopie: 'ok'"                         bash -c "'$FW' --dry-run --hub | grep -q 'Boot-Kopie .* identisch .*ok'"
+# Reboot-Simulation: Ablauf der Anleitung (install-unit, --hub, --confirm --hub), dann 'Boot' = die INSTALLIERTE Kopie mit --restore, Regeln vorher weg
+reset; "$FW" --hub >/dev/null 2>&1; STUB_S_LISTS=1 "$FW" --confirm --hub >/dev/null 2>&1; touch "$STATE/rules-confirmed"; : > "$LOG"
+"$SBIN/forge-docker-user.sh" --restore >/dev/null 2>&1; rc=$?
+check "Boot (installierte Kopie, --restore): 3 Hub-Regeln auf 192.168.10.4:8094 + 8 Edge, kein Timer, Exit 0" bash -c "[ $rc = 0 ] && [ \$(grep -c '^MUT iptables -I.*ctorigdstport 8094 .*forge-nodehub' '$LOG') = 3 ] && [ \$(grep -c '^MUT iptables -I.*forge-edge' '$LOG') = 8 ] && ! grep -q '^ARM ' '$LOG'"
+check "Boot: Reihenfolge Hub-Accepts vor Hub-Drop (kein Fenster mit offenem Port)" bash -c "grep '^MUT iptables -I.*forge-nodehub' '$LOG' | tail -1 | grep -q -- '-j DROP'"
+check "Boot-Nachweis fuer die Anleitung: installierte Kopie --dry-run --restore zeigt 3 forge-nodehub-Zeilen" bash -c "[ \$('$SBIN/forge-docker-user.sh' --dry-run --restore | grep -c '^iptables -I.*forge-nodehub') = 3 ]"
+reset; touch "$STATE/rules-confirmed" "$STATE/hub-rules-confirmed"
+out=$(STUB_IPT_FAIL=1 "$SBIN/forge-docker-user.sh" --restore 2>&1 >/dev/null)
+check "Hub-Restore scheitert: Meldung sagt 'OFFEN' (nicht 'gesperrt')"       bash -c "printf '%s' \"\$1\" | grep -q 'OFFEN' && ! printf '%s' \"\$1\" | grep -q 'bleibt gesperrt'" _ "$out"
 
 # --- Apply: Rollback zuerst, nur Hub-Regeln ---
 reset
