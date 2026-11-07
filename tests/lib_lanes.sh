@@ -15,6 +15,8 @@ make_stub() {
 in="$(cat)"
 id="$(sed -n 's/^id: *//p' <<<"$in" | head -n1)"; sl="$(sed -n 's/^sleep: *//p' <<<"$in" | head -n1)"
 echo "$(date +%s.%N) START $id ${FORGE_LANE:-1}" >> "$STUB_LOG"
+bg="$(sed -n 's/^bg: *//p' <<<"$in" | head -n1)"
+[ -n "$bg" ] && { sleep "$bg" & }          # verwaister Nachkomme, der den Executor ueberlebt
 sleep "${sl:-1}"
 echo "$(date +%s.%N) END $id ${FORGE_LANE:-1}" >> "$STUB_LOG"
 printf '{"type":"result","subtype":"success","session_id":"sid-%s","result":"ok %s","total_cost_usd":0.01}\n' "$id" "$id"
@@ -42,10 +44,10 @@ start_lane() {
 stop_lane() { local p="${LANE_PID[$1]:-}"; [ -n "$p" ] && { kill -TERM "$p" 2>/dev/null; sleep 0.3; kill -KILL "$p" 2>/dev/null; wait "$p" 2>/dev/null; }; LANE_PID[$1]=""; }
 inbox() { if [ "$1" = 1 ]; then echo "$POST/eingang"; else echo "$POST/eingang-$1"; fi; }
 logf()  { if [ "$1" = 1 ]; then echo "$POST/log/postbote.log"; else echo "$POST/log/postbote-lane$1.log"; fi; }
-# brief <lane> <name> <id> <sleep> [repos-Zeile]  (atomar: .tmp -> mv; Punkt-Datei wird nicht gewaehlt)
+# brief <lane> <name> <id> <sleep> [repos-Zeile] [bg-Sekunden]  (atomar: .tmp -> mv; Punkt-Datei wird nicht gewaehlt)
 brief() {
   local d; d="$(inbox "$1")"; mkdir -p "$d"
-  { [ -n "${5:-}" ] && echo "$5"; echo "id: $3"; echo "sleep: $4"; } > "$d/.tmp.$2" && mv "$d/.tmp.$2" "$d/$2"
+  { [ -n "${5:-}" ] && echo "$5"; echo "id: $3"; echo "sleep: $4"; [ -n "${6:-}" ] && echo "bg: $6"; true; } > "$d/.tmp.$2" && mv "$d/.tmp.$2" "$d/$2"
 }
 # wait_for <sek> <befehl...>
 wait_for() { local n="$1" i; shift; for ((i=0;i<n*5;i++)); do "$@" >/dev/null 2>&1 && return 0; sleep 0.2; done; return 1; }

@@ -214,7 +214,13 @@ wait_for 20 ended x4
 check "Lane 2 kill -9: Lane 1 beendet ihren Lauf regulaer"     ended x4
 brief 1 BRIEF_x6.md x6 1 "repos: forge-core"; wait_for 15 ended x6
 check "Lane 1 laeuft nach Absturz von Lane 2 weiter (x6)"      ended x6
-stop_lane 1
+start_lane 2; sleep 2
+brief 1 BRIEF_x7.md x7 1 "repos: forge-core" 25                 # Executor hinterlaesst einen 25 s langen Nachkommen
+wait_for 15 ended x7; brief 2 BRIEF_x8.md x8 1 "repos: forge-core"
+wait_for 12 started x8
+check "verwaister Nachkomme des Executors haelt keine Sperre (Lane 2 startet sofort nach Ende)" started x8
+wait_for 10 ended x8
+stop_lane 2; stop_lane 1
 fi
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------------
