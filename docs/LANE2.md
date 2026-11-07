@@ -34,7 +34,7 @@ Feste Erwerbsreihenfolge => kein Deadlock. **Repo-Satz:** Zeile `repos: forge-co
 
 ## 2. Tests
 
-`tests/test_lanes.sh` (66 Pruefungen, echte Watcher + Stub-claude, ~4 min): Routing (Pfad, Tag, unbekannter Tag, Tag ohne `eingang-2/`), Lane-flock je Lane, Repo-Sperre (gleich => seriell, verschieden => parallel, `none`, unbekannter Name, mehrere Repos, gleiches K), GO-Sperre (GO+GO seriell, GO+Nicht-GO parallel, GO ohne `repos:`, RUN-Plaene aus JSON, Erwerbsreihenfolge), Heartbeat-/Log-/Neustart-Trennung, Absturz (`kill -9`) je Lane, Aktivierungs-Handshake, begrenztes Warten/SIGTERM/`forge-stop` waehrend des Wartens, STOP fuer beide Lanes, Lane 1 inert. `LANE_TEST_BIN=<bin>` prueft eine andere Revision; `LANE_TEST_SECTIONS="3 6"` einzelne Abschnitte.
+`tests/test_lanes.sh` (67 Pruefungen, echte Watcher + Stub-claude, ~3 min): Routing (Pfad, Tag, unbekannter Tag, Tag ohne `eingang-2/`), Lane-flock je Lane, Repo-Sperre (gleich => seriell, verschieden => parallel, `none`, unbekannter Name, mehrere Repos, gleiches K), GO-Sperre (GO+GO seriell, GO+Nicht-GO parallel, GO ohne `repos:`, RUN-Plaene aus JSON, Erwerbsreihenfolge), Heartbeat-/Log-/Neustart-Trennung, Absturz (`kill -9`) je Lane, Aktivierungs-Handshake, begrenztes Warten/SIGTERM/`forge-stop` waehrend des Wartens, STOP fuer beide Lanes, Lane 1 inert. `tests/mutation_lanes.sh`: 14 gezielte Defekte (kein Repo-/Deploy-/K-Lock, gemeinsamer Heartbeat/Log/flock, Sperren im Kind offen, kein Peer-Handshake, kein Timeout/SIGTERM-Abbruch, Routing aus, Lane 1 sperrt immer) - alle erkannt. Gegen master (`LANE_TEST_BIN=<git archive 77df871 bin>`): 44 von 67 Pruefungen FAIL (die 23 gruenen sind Lane-1-unveraendert-Aussagen, die auf beiden Revisionen gelten muessen). `LANE_TEST_BIN=<bin>` prueft eine andere Revision; `LANE_TEST_SECTIONS="3 6"` einzelne Abschnitte.
 `tests/lanes_dryrun_container.sh`: zwei Schein-Auftraege in zwei Lanes in einem Wegwerf-Container (`--rm --network none --read-only`, Repo `:ro`), Zeitleiste + Urteil. Bestehende Suiten (`test_postbote`, `test_heartbeat_env`, `test_restart`, `test_stop`, `test_evidence_order`, `test_run_kind`) unveraendert gruen.
 
 ## 3. Installation / Aktivierung (Owner, root) - erst nach Merge von `lane2` nach forge-ops master
@@ -42,8 +42,8 @@ Feste Erwerbsreihenfolge => kein Deadlock. **Repo-Satz:** Zeile `repos: forge-co
 Voraussetzung: `lane2` (und `n5prep`) sind in `/srv/forge/work/forge-ops` master gemerged. `lane2` fasst `README.md`, `bin/forge-docker-user.sh` und `tests/test_docker_user_hub.sh` (n5prep) nicht an.
 
 ```bash
-# A) Pruefen (als forge, ~4 min, nur Wegwerf-Verzeichnisse; nicht im Nachtfenster 01:00-04:45Z)
-sudo -u forge bash /srv/forge/work/forge-ops/tests/test_lanes.sh | tail -2          # SUMMARY: 66 passed, 0 failed
+# A) Pruefen (als forge, ~3 min, nur Wegwerf-Verzeichnisse; nicht im Nachtfenster 01:00-04:45Z)
+sudo -u forge bash /srv/forge/work/forge-ops/tests/test_lanes.sh | tail -2          # SUMMARY: 67 passed, 0 failed
 # B) Lane 1 auf den neuen Code bringen (Neustart NACH dem aktuellen Run; Lane 1 aendert sich ohne eingang-2/ nicht)
 sudo -u forge /srv/forge/work/forge-ops/bin/forge-request-restart.sh "lane2 code"
 #    warten, bis der Neustart im Log steht:
