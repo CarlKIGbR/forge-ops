@@ -183,12 +183,20 @@ lane_arm() {
   printf '%s lane 1 armed (eingang-2 present): repo/deploy locks active from the next brief on\n' "$(utcl)" >> "$LOGF"
   return 0
 }
+# lane1_running: haelt irgendein Prozess den flock von state/.lock (Lane 1)? Liest /proc/locks (Inode-Vergleich) statt selbst zu locken - ein Probe-flock koennte den Start von Lane 1 stoeren
+# ("laeuft bereits"). Nicht lesbar/Inode unbekannt => "laeuft" (sicherer Standard).
+lane1_running() {
+  local ino
+  ino="$(stat -c %i "$STATE/.lock" 2>/dev/null)" || return 1          # keine Lock-Datei: Lane 1 lief noch nie
+  [ -r /proc/locks ] || return 0
+  awk -v i="$ino" '$2 == "FLOCK" && $6 ~ (":" i "$") { f = 1 } END { exit !f }' /proc/locks 2>/dev/null
+}
 # lane_peer_ok (nur Lane >= 2): Lane 1 haelt entweder nichts (kein Prozess, flock frei) oder hat sich zwischen zwei Laeufen "armed" (PID lebt). Sonst koennte ein Lauf von Lane 1, der VOR der
 # Aktivierung ohne Sperren startete, mit einem Lauf dieser Lane kollidieren => bis dahin startet diese Lane nichts (geloggt, Heartbeat laeuft).
 lane_peer_ok() {
   local pid=""
   [ "$LANE" = 1 ] && return 0
-  if flock -n "$STATE/.lock" true 2>/dev/null; then LANE_PEER_WARNED=0; return 0; fi
+  if ! lane1_running; then LANE_PEER_WARNED=0; return 0; fi
   read -r pid < "$STATE/lane1-armed" 2>/dev/null
   if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then LANE_PEER_WARNED=0; return 0; fi
   if [ "$LANE_PEER_WARNED" = 0 ]; then
