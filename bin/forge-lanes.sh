@@ -169,9 +169,39 @@ lane_holder() {   # nur Auskunft (Log beim Warten); der Halter ist die flock-Bes
   return 0
 }
 
+# ---- Aktivierung: Lane 1 sperrt/markiert NUR, wenn eingang-2/ existiert (ohne Lane 2 ist Lane 1 Byte fuer Byte wie vorher: kein locks/-Verzeichnis, keine Marker) -------------------
+LANE_PEER_WARNED=0
+lane_two_enabled() { [ -d "$(lane_inbox 2)" ]; }
+# lane_arm: Lane 1, ZWISCHEN den Laeufen (Schleifenkopf): sieht sie eingang-2/, schreibt sie state/lane1-armed (= ihre PID; erneut, falls die Datei fehlt oder eine fremde PID traegt).
+# Ab dem naechsten Brief nimmt sie Sperren. Ohne eingang-2/ tut diese Funktion nichts (Lane 1 bleibt unveraendert).
+lane_arm() {
+  local cur=""
+  [ "$LANE" = 1 ] && lane_two_enabled || return 0
+  read -r cur < "$STATE/lane1-armed" 2>/dev/null
+  [ "$cur" = "$$" ] && return 0
+  printf '%s\n' "$$" > "$STATE/.lane1-armed.tmp" && mv -f "$STATE/.lane1-armed.tmp" "$STATE/lane1-armed" || return 0
+  printf '%s lane 1 armed (eingang-2 present): repo/deploy locks active from the next brief on\n' "$(utcl)" >> "$LOGF"
+  return 0
+}
+# lane_peer_ok (nur Lane >= 2): Lane 1 haelt entweder nichts (kein Prozess, flock frei) oder hat sich zwischen zwei Laeufen "armed" (PID lebt). Sonst koennte ein Lauf von Lane 1, der VOR der
+# Aktivierung ohne Sperren startete, mit einem Lauf dieser Lane kollidieren => bis dahin startet diese Lane nichts (geloggt, Heartbeat laeuft).
+lane_peer_ok() {
+  local pid=""
+  [ "$LANE" = 1 ] && return 0
+  if flock -n "$STATE/.lock" true 2>/dev/null; then LANE_PEER_WARNED=0; return 0; fi
+  read -r pid < "$STATE/lane1-armed" 2>/dev/null
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then LANE_PEER_WARNED=0; return 0; fi
+  if [ "$LANE_PEER_WARNED" = 0 ]; then
+    printf '%s PEER lane=%s waiting: lane 1 is running but has not armed its locks (old watcher code or run in flight since before eingang-2 existed); nothing is started here until it does\n' "$(utcl)" "$LANE" >> "$LOGF"
+    LANE_PEER_WARNED=1
+  fi
+  return 1
+}
+
 # lane_lock_for <name>: Sperrplan bilden und in Reihenfolge erwerben. 0 = alles erworben (oder nichts noetig) | 1 = Zeit abgelaufen (nichts gehalten) | 3 = Abbruch
 lane_lock_for() {
   local name="$1" s rc
+  [ "$LANE" = 1 ] && ! lane_two_enabled && return 0   # Lane 1 ohne Lane 2: keine Sperren (unveraendertes Verhalten)
   lane_plan "$name"
   [ "${#PLAN_LOCKS[@]}" -gt 0 ] || return 0
   mkdir -p "$LANE_LOCKS/holders" 2>/dev/null

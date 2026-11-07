@@ -1,0 +1,34 @@
+# fp_lane2.patch - Aenderungen an bin/fp.sh (Mac-Seite, AUSSERHALB dieses Repos) fuer die zweite Postfach-Lane (ADR-040). NICHT angewendet.
+# 1) send <datei> eingang-2 (Ziel-Whitelist + Warnung ohne repos:-Zeile)  2) status zeigt Lane 2 (Eingang, Heartbeat, Log)  3) pull holt log/postbote-lane2.log mit.
+# Geprueft gegen die REKONSTRUIERTE Basis docs/patches/fp_baseline_reconstructed.sh (fp.sh dort ist NICHT das Original). Auf dem Mac: 'patch --dry-run bin/fp.sh < fp_lane2.patch';
+# weichen Hunks ab, die drei Aenderungen sinngemaess uebertragen (jeder Hunk ist eigenstaendig).
+--- a/bin/fp.sh
++++ b/bin/fp.sh
+@@ -7,16 +7,23 @@
+ cmd="${1:-}"; [ $# -gt 0 ] && shift
+ case "$cmd" in
+   send)
+-    f="${1:?send <datei> [eingang]}"; dest="${2:-eingang}"
+-    case "$dest" in eingang) ;; *) echo "fp.sh: unbekanntes Ziel '$dest'" >&2; exit 2 ;; esac
++    f="${1:?send <datei> [eingang|eingang-2]}"; dest="${2:-eingang}"
++    case "$dest" in eingang|eingang-2) ;; *) echo "fp.sh: unbekanntes Ziel '$dest'" >&2; exit 2 ;; esac
++    # Lane 2 (ADR-040): ohne `repos:`-Zeile sperrt der Brief ALLE Repos (serialisiert gegen jeden Lauf der anderen Lane) - hier nur warnen
++    if [ "$dest" = eingang-2 ] && ! head -n 30 "$f" | grep -qiE '^[[:space:]>*_#-]*repos?[*_]*[[:space:]]*:'; then
++      echo "fp.sh: WARNUNG: '$f' hat keine 'repos: <name>, ...'-Zeile in den ersten 30 Zeilen => sperrt alle Repos (Lane 2 laeuft dann nicht parallel)" >&2
++    fi
+     rsync -t "$f" "$HOST:$REMOTE/$dest/" ;;
+   sendtree)
+     d="${1:?sendtree <ordner> anhang/<K>}"; dest="${2:?}"
+     rsync -rt "$d/" "$HOST:$REMOTE/$dest/" ;;
+   pull)
+     rsync -rt "$HOST:$REMOTE/ausgang/" "$LOCAL/ausgang/"
+-    rsync -t "$HOST:$REMOTE/log/postbote.log" "$LOCAL/log/" ;;
++    rsync -t "$HOST:$REMOTE/log/postbote.log" "$LOCAL/log/"
++    rsync -t "$HOST:$REMOTE/log/postbote-lane2.log" "$LOCAL/log/" 2>/dev/null || true ;;   # Lane 2 (existiert erst nach Aktivierung)
+   status)
+-    ssh "$HOST" "cd $REMOTE && echo '== eingang' && ls -l eingang | tail -n +2 && echo '== heartbeat' && cat state/heartbeat && echo '== postbote.log' && tail -n 5 log/postbote.log" ;;
++    ssh "$HOST" "cd $REMOTE && echo '== eingang (Lane 1)' && ls -l eingang | tail -n +2 && echo '== heartbeat (Lane 1)' && cat state/heartbeat && echo '== postbote.log' && tail -n 5 log/postbote.log \
++      && if [ -d eingang-2 ]; then echo '== eingang-2 (Lane 2)' && ls -l eingang-2 | tail -n +2 && echo '== heartbeat-lane2' && cat state/heartbeat-lane2 2>/dev/null \
++      && echo '== postbote-lane2.log' && tail -n 5 log/postbote-lane2.log 2>/dev/null; else echo '(Lane 2 nicht aktiviert: kein eingang-2/)'; fi" ;;
+   *) echo "Aufruf: fp.sh send|sendtree|pull|status" >&2; exit 2 ;;
+ esac

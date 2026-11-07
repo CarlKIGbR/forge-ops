@@ -392,7 +392,13 @@ while :; do
     continue
   fi
   if [ "$PAUSED" = 1 ]; then printf '%s resumed (STOP removed)\n' "$(utcl)" >> "$LOGF"; PAUSED=0; fi
+  lane_arm
   lane_route   # Briefe mit fremdem `.lane-<N>`-Tag in den Eingang der Ziel-Lane verschieben (nur wenn dieser existiert)
+  if ! lane_peer_ok; then   # nur Lane >= 2: wartet, bis Lane 1 ihre Sperren aktiv hat (Log PEER)
+    [ "$ONCE" = 1 ] && break
+    sleep "$POLL" 9>&- & wait $!
+    continue
+  fi
   if name=$(next_brief); then
     if [ -n "${FORGE_HOOK_AFTER_SELECT:-}" ] && [ -x "$FORGE_HOOK_AFTER_SELECT" ]; then "$FORGE_HOOK_AFTER_SELECT" "$name" 9>&-; fi
     # Repo-/GO-Sperren VOR dem Dispatch-Lock (claim_lock in process): Warten haelt nie das Dispatch-Lock. 1 = Zeitgrenze (Brief bleibt, Log LOCKWAIT), 3 = SIGTERM beim Warten

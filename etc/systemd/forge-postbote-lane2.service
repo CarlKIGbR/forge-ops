@@ -1,0 +1,28 @@
+# forge-postbote-lane2.service - zweite Postfach-Lane (ADR-040). NICHT installiert; Installation nur nach docs/LANE2.md (Owner, root).
+# Wie forge-postbote.service (+ Drop-ins 10-forge-ops.conf, 20-killmode.conf), aber FORGE_LANE=2: Eingang post/eingang-2/, flock state/.lock-lane2, Heartbeat state/heartbeat-lane2,
+# Log log/postbote-lane2.log. Derselbe Code (forge-ops master), dieselben Zugangsdaten (claude.env) => ein zusaetzlicher gleichzeitiger Claude-Lauf auf dem Plan.
+[Unit]
+Description=forge-post Postbote Lane 2 (Briefe aus eingang-2/ mit claude -p abarbeiten; Repo-/GO-Sperren gemeinsam mit Lane 1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=forge
+Group=forgebox
+UMask=0002
+Environment=HOME=/srv/forge/home
+Environment=PATH=/srv/forge/home/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=FORGE_BASE=/srv/forge
+Environment=FORGE_LANE=2
+EnvironmentFile=/srv/forge/secrets/claude.env
+WorkingDirectory=/srv/forge/work
+ExecStart=/srv/forge/work/forge-ops/bin/forge-postbote.sh
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+TimeoutStopSec=60
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
