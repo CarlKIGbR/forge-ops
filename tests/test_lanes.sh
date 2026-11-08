@@ -293,5 +293,32 @@ check "Lane 1 ohne Lane 2: state/ enthaelt nur .lock heartbeat q3.session q3.exe
 check "Lane 1 ohne Lane 2: keine Lane-Artefakte (log, Report)"  bash -c "[ ! -e '$POST/log/postbote-lane2.log' ] && ! grep -q '^- Lane' '$POST'/ausgang/REPORT_BRIEF_q3_*.md"
 fi
 
+# ---------------------------------------------------------------------------------------------------------------------------------------------------
+if sec 10; then
+echo "# 10 Re-Aktivierung nach Rollback: veralteter Marker state/lane1-armed darf Lane 2 nie starten lassen (Verify M-1)"
+new_world w10; mkdir -p "$POST/eingang-2"
+start_lane 1; wait_for 10 test -s "$POST/state/lane1-armed"
+rmdir "$POST/eingang-2"                                          # Rollback OHNE den Marker zu loeschen
+sleep 2
+check "Lane 1 raeumt ihren Marker selbst weg, sobald eingang-2/ fehlt" test ! -e "$POST/state/lane1-armed"
+brief 1 BRIEF_ra.md ra 8 "repos: forge-core"; wait_for 15 started ra     # sperrfreier Lauf (eingang-2/ fehlt)
+mkdir -p "$POST/eingang-2"; start_lane 2                        # Re-Aktivierung mitten im sperrfreien Lauf
+brief 2 BRIEF_rb.md rb 2 "repos: forge-core"
+wait_for 40 ended rb; wait_for 20 ended ra
+check "Re-Aktivierung: Lane 2 startet erst nach dem sperrfreien Lauf (kein Overlap, gleiches Repo)" after ra rb
+check "Lane 2 loggt PEER waehrend des sperrfreien Laufs"         grep -q 'PEER lane=2 waiting' "$(logf 2)"
+stop_lane 1; stop_lane 2
+# Marker-Hygiene: ein Marker mit lebender PID, aber falscher Startzeit (PID-Wiederverwendung) zaehlt nicht
+new_world w10b; mkdir -p "$POST/eingang-2"
+( exec flock "$POST/state/.lock" sleep 40 ) & FAKE1=$!; PIDS+=("$FAKE1"); sleep 1
+printf '%s 1\n' "$FAKE1" > "$POST/state/lane1-armed"            # lebende PID, Startzeit passt nicht
+start_lane 2; brief 2 BRIEF_rc.md rc 1 "repos: none"; sleep 4
+check "Marker mit falscher Startzeit: Lane 2 wartet (PEER)"     bash -c "! grep -q ' START rc ' '$STUB_LOG' && grep -q 'PEER lane=2 waiting' '$(logf 2)'"
+printf '%s %s\n' "$FAKE1" "$(sed -e 's/^.*) //' /proc/$FAKE1/stat | awk '{print $20}')" > "$POST/state/lane1-armed"
+wait_for 15 started rc
+check "Marker mit passender PID+Startzeit: Lane 2 startet"      started rc
+kill -9 "$FAKE1" 2>/dev/null; stop_lane 2
+fi
+
 echo; echo "SUMMARY: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]
