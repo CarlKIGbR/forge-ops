@@ -3,7 +3,7 @@
 # Laeuft NUR im Wegwerf-Container (oder lokal mit gesetztem OPSBIN); /srv/forge/post wird nie beruehrt.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-OPSBIN="${OPSBIN:-$HERE/../bin}"
+OPSBIN="${OPSBIN:-$HERE/../bin}"; export OPSBIN
 T=$(mktemp -d); trap 'cleanup_lanes; rm -rf "$T"' EXIT
 # shellcheck source=/dev/null
 . "$HERE/lib_lanes.sh"

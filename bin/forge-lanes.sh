@@ -1,6 +1,7 @@
 # forge-lanes.sh - Lane-Bibliothek des Postboten (ADR-040, zweite Postfach-Lane). WIRD VON forge-postbote.sh GESOURCT, nicht direkt ausgefuehrt.
 #
-# Lane-Auswahl: FORGE_LANE (Standard 1; unterstuetzt: 1, 2). Lane 1 behaelt ALLE heutigen Pfade/Namen (eingang/, state/.lock, state/heartbeat, log/postbote.log,
+# Lane-Auswahl: Argument `--lane N` des Watchers (Standard 1; unterstuetzt: 1, 2) - KEINE Umgebungsvariable: nichts davon gelangt in Executor-Umgebungen, und ein FORGE_LANE in der Umgebung
+#   (z. B. eines Executors, der die Tests laufen laesst) hat keine Wirkung. Lane 1 behaelt ALLE heutigen Pfade/Namen (eingang/, state/.lock, state/heartbeat, log/postbote.log,
 #   state/restart-requested). Lane N>1 bekommt eigene: eingang-N/, state/.lock-laneN, state/heartbeat-laneN, log/postbote-laneN.log, state/restart-requested-laneN.
 #   Roh-Logs je Run (log/<ts>_<base>.json|.stderr), erledigt/ und ausgang/ bleiben FLACH und gemeinsam (der forge-core-Importer globbt flach); Reports der Lane N>1 tragen "- Lane: N".
 # Dateiname: optionales Segment `.lane-<N>` direkt vor `.n-<8 hex>` bzw. `.md`. Der Eingang entscheidet; liegt ein Brief mit fremdem Tag im Eingang, verschiebt der Watcher ihn
@@ -16,8 +17,8 @@
 #   Warten ist begrenzt (FORGE_LANE_LOCK_WAIT, Standard 18000 s > FORGE_MAX_SECONDS), geloggt ("LOCKWAIT ...") und haelt den Heartbeat am Leben; nach Ablauf bleibt der Brief
 #   in eingang/ und wird erneut versucht (lautes Log, nie stilles Scheitern). Der Dispatch-Lock (control/.dispatch.lock) wird NIE waehrend des Wartens gehalten.
 
-LANE="${FORGE_LANE:-1}"
-case "$LANE" in 1|2) ;; *) echo "FEHLER: FORGE_LANE=$LANE nicht unterstuetzt (1 oder 2)" >&2; exit 2 ;; esac
+LANE="${LANE:-1}"
+case "$LANE" in 1|2) ;; *) echo "FEHLER: --lane $LANE nicht unterstuetzt (1 oder 2)" >&2; exit 2 ;; esac
 
 # lane_paths: setzt EIN, LANE_LOCK_FILE, HBF, LOGF, RESTART_FLAG, LANE_SUF, LANE_LOCKS (benoetigt POST, STATE, LOGD)
 lane_paths() {
@@ -51,9 +52,11 @@ lane_route() {
     if mv -n "$f" "$dst/$n" 2>/dev/null; then printf '%s ROUTED %s lane %s -> lane %s\n' "$(utcl)" "$n" "$LANE" "$t" >> "$LOGF"; fi
   done
 }
-# lane_canon <name>: Dateiname ohne das eigene `.lane-<LANE>`-Segment (fuer die Schema-Pruefung); fremde/unbekannte Tags bleiben stehen (=> ABGELEHNT wie heute)
+# lane_canon <name>: Dateiname ohne das eigene `.lane-<LANE>`-Segment (fuer die Schema-Pruefung); fremde/unbekannte Tags bleiben stehen (=> ABGELEHNT wie heute).
+# Lane 1 kennt das Tag nur, solange eingang-2/ existiert; sonst ist sie master-identisch (auch `.lane-1` => ABGELEHNT bzw. Teil der Modell-ID).
 lane_canon() {
   local n="$1"
+  if [ "$LANE" = 1 ] && ! lane_two_enabled; then printf '%s\n' "$n"; return 0; fi
   if [[ "$n" =~ ^(.+)\.lane-([0-9]+)((\.n-[0-9a-f]{8})?\.md)$ ]] && [ "${BASH_REMATCH[2]}" = "$LANE" ]; then
     printf '%s%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}"
   else
@@ -172,14 +175,19 @@ lane_holder() {   # nur Auskunft (Log beim Warten); der Halter ist die flock-Bes
 # ---- Aktivierung: Lane 1 sperrt/markiert NUR, wenn eingang-2/ existiert (ohne Lane 2 ist Lane 1 Byte fuer Byte wie vorher: kein locks/-Verzeichnis, keine Marker) -------------------
 LANE_PEER_WARNED=0
 lane_two_enabled() { [ -d "$(lane_inbox 2)" ]; }
-# lane_arm: Lane 1, ZWISCHEN den Laeufen (Schleifenkopf): sieht sie eingang-2/, schreibt sie state/lane1-armed (= ihre PID; erneut, falls die Datei fehlt oder eine fremde PID traegt).
-# Ab dem naechsten Brief nimmt sie Sperren. Ohne eingang-2/ tut diese Funktion nichts (Lane 1 bleibt unveraendert).
+# lane_starttime <pid>: Startzeit (Ticks, /proc/<pid>/stat Feld 22) - schuetzt vor PID-Wiederverwendung
+lane_starttime() { sed -e 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{ print $20 }'; }
+# lane_arm: Lane 1, ZWISCHEN den Laeufen (Schleifenkopf). Marker state/lane1-armed = "<PID> <Startzeit>" ihres Watchers:
+#   eingang-2/ vorhanden => Marker setzen (ab dem naechsten Brief Sperren);
+#   eingang-2/ fehlt     => Marker LOESCHEN (veralteter Marker nach einem Rollback darf nie gelten; lane_lock_for loescht ihn zusaetzlich unmittelbar vor jedem sperrfreien Lauf).
 lane_arm() {
-  local cur=""
-  [ "$LANE" = 1 ] && lane_two_enabled || return 0
+  local cur="" want
+  [ "$LANE" = 1 ] || return 0
+  if ! lane_two_enabled; then [ -e "$STATE/lane1-armed" ] && rm -f "$STATE/lane1-armed"; return 0; fi
+  want="$$ $(lane_starttime $$)"
   read -r cur < "$STATE/lane1-armed" 2>/dev/null
-  [ "$cur" = "$$" ] && return 0
-  printf '%s\n' "$$" > "$STATE/.lane1-armed.tmp" && mv -f "$STATE/.lane1-armed.tmp" "$STATE/lane1-armed" || return 0
+  [ "$cur" = "$want" ] && return 0
+  printf '%s\n' "$want" > "$STATE/.lane1-armed.tmp" && mv -f "$STATE/.lane1-armed.tmp" "$STATE/lane1-armed" || return 0
   printf '%s lane 1 armed (eingang-2 present): repo/deploy locks active from the next brief on\n' "$(utcl)" >> "$LOGF"
   return 0
 }
@@ -194,11 +202,11 @@ lane1_running() {
 # lane_peer_ok (nur Lane >= 2): Lane 1 haelt entweder nichts (kein Prozess, flock frei) oder hat sich zwischen zwei Laeufen "armed" (PID lebt). Sonst koennte ein Lauf von Lane 1, der VOR der
 # Aktivierung ohne Sperren startete, mit einem Lauf dieser Lane kollidieren => bis dahin startet diese Lane nichts (geloggt, Heartbeat laeuft).
 lane_peer_ok() {
-  local pid=""
+  local pid="" st=""
   [ "$LANE" = 1 ] && return 0
   if ! lane1_running; then LANE_PEER_WARNED=0; return 0; fi
-  read -r pid < "$STATE/lane1-armed" 2>/dev/null
-  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then LANE_PEER_WARNED=0; return 0; fi
+  read -r pid st < "$STATE/lane1-armed" 2>/dev/null
+  if [[ "$pid" =~ ^[0-9]+$ ]] && [ -n "$st" ] && [ "$(lane_starttime "$pid")" = "$st" ]; then LANE_PEER_WARNED=0; return 0; fi
   if [ "$LANE_PEER_WARNED" = 0 ]; then
     printf '%s PEER lane=%s waiting: lane 1 is running but has not armed its locks (old watcher code or run in flight since before eingang-2 existed); nothing is started here until it does\n' "$(utcl)" "$LANE" >> "$LOGF"
     LANE_PEER_WARNED=1
@@ -209,7 +217,11 @@ lane_peer_ok() {
 # lane_lock_for <name>: Sperrplan bilden und in Reihenfolge erwerben. 0 = alles erworben (oder nichts noetig) | 1 = Zeit abgelaufen (nichts gehalten) | 3 = Abbruch
 lane_lock_for() {
   local name="$1" s rc
-  [ "$LANE" = 1 ] && ! lane_two_enabled && return 0   # Lane 1 ohne Lane 2: keine Sperren (unveraendertes Verhalten)
+  if [ "$LANE" = 1 ] && ! lane_two_enabled; then   # Lane 1 ohne Lane 2: keine Sperren (unveraendertes Verhalten)
+    # ERST den Marker loeschen, DANN erneut pruefen: ein Lane 2, das waehrend dieses sperrfreien Laufs aktiviert wird, findet keinen Marker und wartet (PEER); entsteht eingang-2/ gerade jetzt, sperrt Lane 1 doch
+    [ -e "$STATE/lane1-armed" ] && rm -f "$STATE/lane1-armed"
+    lane_two_enabled || return 0
+  fi
   lane_plan "$name"
   [ "${#PLAN_LOCKS[@]}" -gt 0 ] || return 0
   mkdir -p "$LANE_LOCKS/holders" 2>/dev/null

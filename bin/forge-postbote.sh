@@ -27,7 +27,7 @@
 #   angefasst (bleibt in eingang/, "paused by STOP"). Das Lock wird nach dem Spawn freigegeben (Laeufe dauern Stunden). forge-stop wartet auf das Lock => entweder
 #   startete der Brief vor STOP (laeuft weiter, F5c) oder gar nicht. Ein rohes `touch STOP` ohne forge-stop ist best effort: garantiert nur fuer Briefs, deren gesperrte
 #   Startpruefung nach dem touch liegt. Test-Haken (nur Tests): FORGE_HOOK_AFTER_SELECT / FORGE_HOOK_IN_CLAIM = ausfuehrbare Datei, nach der Auswahl bzw. im Lock-Abschnitt.
-# Lanes (ADR-040): FORGE_LANE=2 startet die zweite Lane (eigener Eingang eingang-2/, eigener flock/Heartbeat/Logstrom, Repo-/GO-Sperren); ohne FORGE_LANE (=1) verhaelt sich der Watcher
+# Lanes (ADR-040): `--lane 2` startet die zweite Lane (eigener Eingang eingang-2/, eigener flock/Heartbeat/Logstrom, Repo-/GO-Sperren); ohne --lane (=1) verhaelt sich der Watcher
 #   wie bisher. Details und Sperrregeln: bin/forge-lanes.sh, docs/LANE2.md.
 # Flags: --once  (eine Runde: alle faelligen Briefe abarbeiten, dann Ende)
 set -u
@@ -40,15 +40,18 @@ POLL="${FORGE_POLL:-5}"
 MIN_AGE="${FORGE_MIN_AGE:-3}"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 CODEX_BIN="${CODEX_BIN:-codex}"
-ONCE=0
-[ "${1:-}" = "--once" ] && ONCE=1
+ONCE=0; LANE=1
+while [ $# -gt 0 ]; do   # --once | --lane N | --lane=N (Lane nur per Argument, nie per Umgebung)
+  case "$1" in --once) ONCE=1 ;; --lane) shift; LANE="${1:-}" ;; --lane=*) LANE="${1#--lane=}" ;; esac
+  shift
+done
+unset FORGE_LANE   # frueherer/fremder Umgebungswert hat keine Wirkung und gelangt nicht in Executor-Umgebungen
 # Executor-Umgebung (MCP-Token, spaeter OTEL) aus forge-exec-env.sh
 # shellcheck source=/dev/null
 . "$(dirname "${BASH_SOURCE[0]}")/forge-exec-env.sh" 2>/dev/null || forge_exec_env() { :; }
 # Lane-Bibliothek (Pfade je Lane, Routing, Repo-/GO-Sperren); fehlt sie, startet der Watcher nicht (keine Lane ohne Sperren)
 # shellcheck source=/dev/null
 . "$BINDIR/forge-lanes.sh" || { echo "FEHLER: forge-lanes.sh fehlt neben dem Watcher" >&2; exit 1; }
-[ "$LANE" = 1 ] || export FORGE_LANE="$LANE"
 
 umask 0002
 export PATH="${HOME:-/srv/forge/home}/.local/bin:$PATH"

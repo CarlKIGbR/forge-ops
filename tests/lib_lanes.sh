@@ -1,4 +1,5 @@
 # Gemeinsame Hilfen der Lane-Tests (tests/test_lanes.sh, tests/lanes_dryrun_container.sh): Wegwerf-Postfach, Stub-claude mit Zeitleiste, zwei Watcher (Lane 1/2) als Hintergrundprozesse.
+# Lane per Argument (--lane N); STUB_LANE ist nur die Test-Kennung fuer den Stub (die Executor-Umgebung bekommt KEINE Lane-Variable).
 # Voraussetzung: $T (Temp-Verzeichnis), $OPSBIN (bin/ der zu testenden Revision) gesetzt. Kein Netz, keine Auth, keine echten Geheimnisse.
 PASS=0; FAIL=0
 ok()  { echo "PASS  $1"; PASS=$((PASS+1)); }
@@ -14,11 +15,14 @@ make_stub() {
 #!/usr/bin/env bash
 in="$(cat)"
 id="$(sed -n 's/^id: *//p' <<<"$in" | head -n1)"; sl="$(sed -n 's/^sleep: *//p' <<<"$in" | head -n1)"
-echo "$(date +%s.%N) START $id ${FORGE_LANE:-1}" >> "$STUB_LOG"
+echo "$(date +%s.%N) START $id ${STUB_LANE:-1}" >> "$STUB_LOG"
+echo "${FORGE_LANE-unset}" > "$STUB_LOG.env.$id"          # Lane-Variable darf nie in der Executor-Umgebung stehen
+rs="$(sed -n 's/^restart: *//p' <<<"$in" | head -n1)"
+[ -n "$rs" ] && bash "$OPSBIN/forge-request-restart.sh" "stub $id" >/dev/null
 bg="$(sed -n 's/^bg: *//p' <<<"$in" | head -n1)"
 [ -n "$bg" ] && { sleep "$bg" & }          # verwaister Nachkomme, der den Executor ueberlebt
 sleep "${sl:-1}"
-echo "$(date +%s.%N) END $id ${FORGE_LANE:-1}" >> "$STUB_LOG"
+echo "$(date +%s.%N) END $id ${STUB_LANE:-1}" >> "$STUB_LOG"
 printf '{"type":"result","subtype":"success","session_id":"sid-%s","result":"ok %s","total_cost_usd":0.01}\n' "$id" "$id"
 S
   chmod +x "$T/claude"
@@ -38,7 +42,7 @@ new_world() {
 declare -A LANE_PID
 start_lane() {
   local n="$1" out; out="$(dirname "$STUB_LOG")/lane$n.out"
-  ( FORGE_LANE="$n" exec bash "$OPSBIN/forge-postbote.sh" >> "$out" 2>&1 ) &
+  ( STUB_LANE="$n" exec bash "$OPSBIN/forge-postbote.sh" --lane "$n" >> "$out" 2>&1 ) &
   LANE_PID[$n]=$!; PIDS+=("$!")
 }
 stop_lane() { local p="${LANE_PID[$1]:-}"; [ -n "$p" ] && { kill -TERM "$p" 2>/dev/null; sleep 0.3; kill -KILL "$p" 2>/dev/null; wait "$p" 2>/dev/null; }; LANE_PID[$1]=""; }

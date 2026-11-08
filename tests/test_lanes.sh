@@ -4,7 +4,7 @@
 # LANE_TEST_BIN=<bin-Verzeichnis> prueft eine andere Revision (z. B. master: die Lane-Tests muessen dort FEHLSCHLAGEN).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-OPSBIN="${LANE_TEST_BIN:-$HERE/../bin}"
+OPSBIN="${LANE_TEST_BIN:-$HERE/../bin}"; export OPSBIN
 T=$(mktemp -d); trap 'cleanup_lanes; [ -n "${LANE_TEST_KEEP:-}" ] && echo "KEEP: $T" || rm -rf "$T"' EXIT
 # shellcheck source=/dev/null
 . "$HERE/lib_lanes.sh"
@@ -20,8 +20,8 @@ start_lane 1; start_lane 2
 brief 1 BRIEF_r1.md r1 1 "repos: none"
 brief 2 BRIEF_r2.md r2 1 "repos: none"
 wait_for 20 ended r1; wait_for 20 ended r2; sleep 2
-check "Lane 1: Brief aus eingang/ laeuft mit FORGE_LANE=1"   grep -q ' START r1 1$' "$STUB_LOG"
-check "Lane 2: Brief aus eingang-2/ laeuft mit FORGE_LANE=2" grep -q ' START r2 2$' "$STUB_LOG"
+check "Lane 1: Brief aus eingang/ laeuft mit --lane 1"   grep -q ' START r1 1$' "$STUB_LOG"
+check "Lane 2: Brief aus eingang-2/ laeuft mit --lane 2" grep -q ' START r2 2$' "$STUB_LOG"
 R1=$(ls "$POST"/ausgang/REPORT_BRIEF_r1_* 2>/dev/null | head -n1); R2=$(ls "$POST"/ausgang/REPORT_BRIEF_r2_* 2>/dev/null | head -n1)
 check "Report Lane 2 traegt '- Lane: 2'"                     grep -q '^- Lane: 2$' "${R2:-/nonexistent}"
 check "Report Lane 1 traegt KEINE Lane-Zeile (wie heute)"    bash -c "[ -f '${R1:-/nonexistent}' ] && ! grep -q '^- Lane:' '$R1'"
@@ -46,6 +46,9 @@ start_lane 1
 brief 1 BRIEF_u1.lane-2.md u1 1 "repos: none"
 wait_for 15 bash -c "ls '$POST'/ausgang/REPORT_BRIEF_u1.lane-2_*"
 check "ohne eingang-2/: .lane-2 => ABGELEHNT wie bisher, Datei nicht verschoben" bash -c "grep -q ABGELEHNT '$POST'/ausgang/REPORT_BRIEF_u1.lane-2_*.md && [ ! -d '$POST/eingang-2' ]"
+brief 1 BRIEF_u2.lane-1.md u2 1 "repos: none"
+wait_for 15 bash -c "ls '$POST'/ausgang/REPORT_BRIEF_u2.lane-1_*"
+check "ohne eingang-2/: .lane-1 => ABGELEHNT wie master (nicht ausgefuehrt)" bash -c "grep -q ABGELEHNT '$POST'/ausgang/REPORT_BRIEF_u2.lane-1_*.md && ! grep -q ' START u2 ' '$STUB_LOG'"
 check "ohne Lane 2: keine locks/-Dateien, kein lane1-armed"  bash -c "[ ! -e '$POST/state/locks' ] && [ ! -e '$POST/state/lane1-armed' ]"
 stop_lane 1
 fi
@@ -57,12 +60,12 @@ new_world w2; mkdir -p "$POST/eingang-2"
 start_lane 1; start_lane 2; sleep 2
 check "Lane 1 und Lane 2 laufen gleichzeitig"                bash -c "kill -0 ${LANE_PID[1]} && kill -0 ${LANE_PID[2]}"
 check "getrennte flock-Dateien .lock / .lock-lane2"          bash -c "[ -e '$POST/state/.lock' ] && [ -e '$POST/state/.lock-lane2' ]"
-out2=$(FORGE_LANE=2 timeout 10 bash "$OPSBIN/forge-postbote.sh" 2>&1); rc2=$?
+out2=$(timeout 10 bash "$OPSBIN/forge-postbote.sh" --lane 2 2>&1); rc2=$?
 check "zweite Instanz Lane 2: Exit 1 'laeuft bereits'"       bash -c "[ $rc2 = 1 ] && grep -q 'laeuft bereits' <<<'$out2'"
-out1=$(FORGE_LANE=1 timeout 10 bash "$OPSBIN/forge-postbote.sh" 2>&1); rc1=$?
+out1=$(timeout 10 bash "$OPSBIN/forge-postbote.sh" --lane 1 2>&1); rc1=$?
 check "zweite Instanz Lane 1: Exit 1 'laeuft bereits'"       bash -c "[ $rc1 = 1 ] && grep -q 'laeuft bereits' <<<'$out1'"
-FORGE_LANE=7 bash "$OPSBIN/forge-postbote.sh" >/dev/null 2>&1; rc7=$?
-check "FORGE_LANE=7: nicht unterstuetzt, Exit 2"             test "$rc7" = 2
+bash "$OPSBIN/forge-postbote.sh" --lane 7 >/dev/null 2>&1; rc7=$?
+check "--lane 7: nicht unterstuetzt, Exit 2"             test "$rc7" = 2
 stop_lane 1; stop_lane 2
 fi
 
@@ -146,7 +149,7 @@ wait_for 40 ended h4
 check "GO ohne repos: => seriell"                              after h3 h4
 stop_lane 1; stop_lane 2
 # RUN: Sperrplan aus dem JSON-Auftrag (Bibliothek direkt)
-plan() { ( BINDIR="$OPSBIN"; POST="$T/p/post"; STATE="$POST/state"; LOGD="$POST/log"; LOGF="$LOGD/x.log"; FORGE_LANE=1; export FORGE_LANE_REPOS_FILE="$T/repos.list"
+plan() { ( BINDIR="$OPSBIN"; POST="$T/p/post"; STATE="$POST/state"; LOGD="$POST/log"; LOGF="$LOGD/x.log"; LANE=1; export FORGE_LANE_REPOS_FILE="$T/repos.list"
            utcl() { :; }; . "$OPSBIN/forge-lanes.sh" 2>/dev/null || exit 9; lane_paths; mkdir -p "$EIN"; cp "$1" "$EIN/$2"; lane_plan "$2"; echo "${PLAN_LOCKS[*]}" ); }
 mkdir -p "$T/p"
 printf '{"args":{"base":"main","branch":"x","expected_head":"%040d","repo":"forge-core"},"graph_run_id":1,"job":"merge","key":"m:1","nonce":"aaaaaaaa"}' 0 > "$T/p/merge.json"
@@ -169,15 +172,18 @@ stop_lane 2; h1a=$(cat "$POST/state/heartbeat"); h2a=$(cat "$POST/state/heartbea
 h1b=$(cat "$POST/state/heartbeat"); h2b=$(cat "$POST/state/heartbeat-lane2")
 check "Lane 2 gestoppt: ihr Heartbeat steht, der von Lane 1 laeuft" bash -c "[ '$h2a' = '$h2b' ] && [ '$h1a' != '$h1b' ]"
 start_lane 2; sleep 2
-FORGE_LANE=2 bash "$OPSBIN/forge-request-restart.sh" "lane2 test" >/dev/null
-check "forge-request-restart.sh mit FORGE_LANE=2: Flag restart-requested-lane2" bash -c "[ -e '$POST/state/restart-requested-lane2' ] && [ ! -e '$POST/state/restart-requested' ]"
+printf 'reason=test\nrequester=t\ntime=x\n' > "$POST/state/restart-requested-lane2"        # Flag nur fuer Lane 2
 wait_for 10 bash -c "! kill -0 ${LANE_PID[2]}"
-check "Lane 2 beendet sich (Exit 0) und loggt RESTART in IHREM Log" bash -c "grep -q 'RESTART requested' '$(logf 2)' && ! grep -q RESTART '$(logf 1)'"
+check "Lane-2-Flag: Lane 2 beendet sich (Exit 0) und loggt RESTART in IHREM Log" bash -c "grep -q 'RESTART requested' '$(logf 2)' && ! grep -q RESTART '$(logf 1)'"
 check "Lane 1 laeuft weiter"                                   kill -0 "${LANE_PID[1]}"
-bash "$OPSBIN/forge-request-restart.sh" "lane1 test" >/dev/null
-check "ohne FORGE_LANE: Flag restart-requested (unveraendert)" test -e "$POST/state/restart-requested"
-wait_for 10 bash -c "! kill -0 ${LANE_PID[1]}"
-check "Lane 1 beendet sich, RESTART in postbote.log"           grep -q 'RESTART requested' "$(logf 1)"
+start_lane 2; sleep 2
+bash "$OPSBIN/forge-request-restart.sh" "beide Lanes" >/dev/null
+check "forge-request-restart.sh mit eingang-2/: BEIDE Flags"   bash -c "[ -e '$POST/state/restart-requested' ] && [ -e '$POST/state/restart-requested-lane2' ]"
+wait_for 10 bash -c "! kill -0 ${LANE_PID[1]} && ! kill -0 ${LANE_PID[2]}"
+check "beide Lanes beenden sich, RESTART in beiden Logs"       bash -c "grep -q 'RESTART requested' '$(logf 1)' && [ \$(grep -c 'RESTART requested' '$(logf 2)') = 2 ]"
+rm -rf "$POST/eingang-2"; rm -f "$POST/state"/restart-requested*
+bash "$OPSBIN/forge-request-restart.sh" "nur Lane 1" >/dev/null
+check "ohne eingang-2/: nur restart-requested (master-identisch)" bash -c "[ -e '$POST/state/restart-requested' ] && [ ! -e '$POST/state/restart-requested-lane2' ]"
 stop_lane 1
 
 # Heartbeat waehrend eines laengeren Laufs UND waehrend des Wartens auf eine Sperre
@@ -318,6 +324,24 @@ printf '%s %s\n' "$FAKE1" "$(sed -e 's/^.*) //' /proc/$FAKE1/stat | awk '{print 
 wait_for 15 started rc
 check "Marker mit passender PID+Startzeit: Lane 2 startet"      started rc
 kill -9 "$FAKE1" 2>/dev/null; stop_lane 2
+fi
+
+# ---------------------------------------------------------------------------------------------------------------------------------------------------
+if sec 11; then
+echo "# 11 Keine Lane-Variable in Executor-Umgebungen; FORGE_LANE in der Eltern-Umgebung wirkungslos; Neustart-Wunsch gilt fuer BEIDE Lanes (Verify m-2)"
+new_world w11; mkdir -p "$POST/eingang-2"
+export FORGE_LANE=2                                              # wie in der Umgebung eines Lane-2-Executors, der forge-ops-Tests laufen laesst
+start_lane 1; start_lane 2; wait_for 10 test -s "$POST/state/lane1-armed"
+brief 1 BRIEF_v1.md v1 1 "repos: none"
+printf 'repos: forge-core\nid: v2\nsleep: 1\nrestart: 1\n' > "$POST/eingang-2/GO_v2.md"
+wait_for 20 ended v1; wait_for 20 ended v2
+check "Lane aus --lane, nicht aus FORGE_LANE: Brief aus eingang/ lief als Lane 1" grep -q ' START v1 1$' "$STUB_LOG"
+check "Brief aus eingang-2/ lief als Lane 2"                   grep -q ' START v2 2$' "$STUB_LOG"
+check "Executor-Umgebung Lane 1: FORGE_LANE nicht gesetzt"      grep -qx unset "$STUB_LOG.env.v1"
+check "Executor-Umgebung Lane 2: FORGE_LANE nicht gesetzt"      grep -qx unset "$STUB_LOG.env.v2"
+wait_for 20 bash -c "! kill -0 ${LANE_PID[1]} && ! kill -0 ${LANE_PID[2]}"
+check "forge-request-restart.sh in einem Lane-2-GO: beide Lanes starten neu" bash -c "grep -q 'RESTART requested by .*GO_v2' '$(logf 1)' && grep -q 'RESTART requested by .*GO_v2' '$(logf 2)'"
+unset FORGE_LANE
 fi
 
 echo; echo "SUMMARY: $PASS passed, $FAIL failed"
