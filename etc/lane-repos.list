@@ -1,0 +1,9 @@
+# Repos, die in `repos:`-Zeilen eines Briefs bzw. als RUN-args.repo einen EIGENEN Repo-Lock bekommen (bin/forge-lanes.sh). Ein Name, der hier fehlt, sperrt ALLES (sicherer Standard).
+# Logische Repo-Namen, nicht Worktree-Verzeichnisse (forge-core-f5dgf2c ist forge-core).
+forge-core
+forge-ops
+forge-node
+forge-docs
+forge-standards
+forge-edge
+fundament

@@ -8,6 +8,9 @@ Weil das Modell-Segment gierig matcht, spaltet der Watcher ein endstaendiges `.n
 auf `.n-<8hex>` enden** (z.B. wird `.modell-demo.n-deadbeef.md` als Modell `demo` + Nonce `deadbeef` ausgefuehrt). forge-core (Cockpit/Config) erzwingt das.
 Tests: `tests/test_postbote.sh`.
 
+## Zweite Postfach-Lane (ADR-040)
+Optional: `forge-postbote.sh --lane 2` (eigener Eingang `eingang-2/`, flock, Heartbeat, Log; Repo-/GO-Sperren gemeinsam mit Lane 1). Ohne `eingang-2/` verhaelt sich Lane 1 wie zuvor. Design, Aktivierungs-Checkliste, Rollback: `docs/LANE2.md`. Tests: `tests/test_lanes.sh`.
+
 ## Graceful Restart (M-43)
 `bin/forge-request-restart.sh "<grund>"` legt atomar `post/state/restart-requested` an (reason, requester=`$FORGE_RUN_ID`). Der Watcher prueft das Flag nur zwischen
 Runs (nach Finalisierung, vor dem naechsten Brief), loggt `RESTART requested by <id>` und beendet sich mit 0 (systemd `Restart=always`). Laufende Runs werden nie unterbrochen;

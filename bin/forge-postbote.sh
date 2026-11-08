@@ -27,6 +27,8 @@
 #   angefasst (bleibt in eingang/, "paused by STOP"). Das Lock wird nach dem Spawn freigegeben (Laeufe dauern Stunden). forge-stop wartet auf das Lock => entweder
 #   startete der Brief vor STOP (laeuft weiter, F5c) oder gar nicht. Ein rohes `touch STOP` ohne forge-stop ist best effort: garantiert nur fuer Briefs, deren gesperrte
 #   Startpruefung nach dem touch liegt. Test-Haken (nur Tests): FORGE_HOOK_AFTER_SELECT / FORGE_HOOK_IN_CLAIM = ausfuehrbare Datei, nach der Auswahl bzw. im Lock-Abschnitt.
+# Lanes (ADR-040): `--lane 2` startet die zweite Lane (eigener Eingang eingang-2/, eigener flock/Heartbeat/Logstrom, Repo-/GO-Sperren); ohne --lane (=1) verhaelt sich der Watcher
+#   wie bisher. Details und Sperrregeln: bin/forge-lanes.sh, docs/LANE2.md.
 # Flags: --once  (eine Runde: alle faelligen Briefe abarbeiten, dann Ende)
 set -u
 
@@ -38,26 +40,34 @@ POLL="${FORGE_POLL:-5}"
 MIN_AGE="${FORGE_MIN_AGE:-3}"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 CODEX_BIN="${CODEX_BIN:-codex}"
-ONCE=0
-[ "${1:-}" = "--once" ] && ONCE=1
+ONCE=0; LANE=1
+while [ $# -gt 0 ]; do   # --once | --lane N | --lane=N (Lane nur per Argument, nie per Umgebung)
+  case "$1" in --once) ONCE=1 ;; --lane) shift; LANE="${1:-}" ;; --lane=*) LANE="${1#--lane=}" ;; esac
+  shift
+done
+unset FORGE_LANE   # frueherer/fremder Umgebungswert hat keine Wirkung und gelangt nicht in Executor-Umgebungen
 # Executor-Umgebung (MCP-Token, spaeter OTEL) aus forge-exec-env.sh
 # shellcheck source=/dev/null
 . "$(dirname "${BASH_SOURCE[0]}")/forge-exec-env.sh" 2>/dev/null || forge_exec_env() { :; }
+# Lane-Bibliothek (Pfade je Lane, Routing, Repo-/GO-Sperren); fehlt sie, startet der Watcher nicht (keine Lane ohne Sperren)
+# shellcheck source=/dev/null
+. "$BINDIR/forge-lanes.sh" || { echo "FEHLER: forge-lanes.sh fehlt neben dem Watcher" >&2; exit 1; }
 
 umask 0002
 export PATH="${HOME:-/srv/forge/home}/.local/bin:$PATH"
 
-RESTART_FLAG="$POST/state/restart-requested"
 STOP_FILE="${FORGE_STOP_FILE:-$POST/control/STOP}"; PAUSED=0
 LOCK_FILE="${FORGE_DISPATCH_LOCK:-$POST/control/.dispatch.lock}"; LOCKED=0
-EIN="$POST/eingang"; AUS="$POST/ausgang"; ERL="$POST/erledigt"
+AUS="$POST/ausgang"; ERL="$POST/erledigt"
 LOGD="$POST/log"; STATE="$POST/state"
+lane_paths   # EIN, LANE_LOCK_FILE, HBF, HBTMP, LOGF, RESTART_FLAG (Lane 1: eingang/, state/.lock, state/heartbeat, log/postbote.log, state/restart-requested)
 mkdir -p "$EIN" "$AUS" "$ERL" "$LOGD" "$STATE" "$WORK" || { echo "FEHLER: Verzeichnisse nicht anlegbar unter $BASE" >&2; exit 1; }
+[ "$LANE" = 1 ] || chmod 2775 "$EIN" 2>/dev/null
 
 # Nur eine Instanz gleichzeitig
-exec 9>"$STATE/.lock"
+exec 9>"$LANE_LOCK_FILE"
 if ! flock -n 9; then
-  echo "Postbote laeuft bereits (flock auf $STATE/.lock)" >&2
+  echo "Postbote laeuft bereits (flock auf $LANE_LOCK_FILE)" >&2
   exit 1
 fi
 
@@ -135,14 +145,14 @@ write_report() {
 }
 
 heartbeat() {
-  utcl > "$STATE/.heartbeat.tmp" && mv -f "$STATE/.heartbeat.tmp" "$STATE/heartbeat"
+  utcl > "$HBTMP" && mv -f "$HBTMP" "$HBF"
 }
 
 # Solange ein Auftrag laeuft, alle FORGE_HB_INTERVAL s (45; Abstand inkl. Overhead <= 50) einen Heartbeat schreiben (sonst "stale" bei langen Runs)
 HBPID=""
 hb_start() {
   # stdout/stderr/Lock-FD schliessen: ein verwaister sleep darf weder Pipes des Aufrufers noch den flock halten
-  ( while kill -0 "$$" 2>/dev/null; do sleep "${FORGE_HB_INTERVAL:-45}" >/dev/null 2>&1 9>&- & wait $!; kill -0 "$$" 2>/dev/null && heartbeat; done ) >/dev/null 2>&1 9>&- &
+  ( lane_close_fds; while kill -0 "$$" 2>/dev/null; do sleep "${FORGE_HB_INTERVAL:-45}" >/dev/null 2>&1 9>&- & wait $!; kill -0 "$$" 2>/dev/null && heartbeat; done ) >/dev/null 2>&1 9>&- &
   HBPID=$!
 }
 hb_stop() {
@@ -186,8 +196,9 @@ unclaim() {   # LOCK_UN wirkt auf die offene Dateibeschreibung, also auch dann, 
 
 process() {
   local name="$1" base art k fort model nonce="" exec aufwand oldexec="" rejected=0 sid="" start end t0 t1 dur rc=0
-  local ts run json err head body cost reportname
+  local ts run json err head body cost reportname cname
   base="${name%.md}"
+  cname="$(lane_canon "$name")"   # eigenes `.lane-<N>`-Segment fuer die Schema-Pruefung entfernt; ohne Tag (Lane 1 heute) == $name
   claim_lock; local c=$?
   [ "$c" = 0 ] || return $((70 + c))   # 71 = STOP, 72 = Lock nicht verfuegbar: Brief unangetastet in eingang/
   ts=$(utc)
@@ -197,7 +208,7 @@ process() {
   reportname="REPORT_${base}_${ts}.md"
 
   local ok=0 m
-  if [[ "$name" =~ $re ]]; then
+  if [[ "$cname" =~ $re ]]; then
     art="${BASH_REMATCH[1]}"; k="${BASH_REMATCH[2]}"
     fort="${BASH_REMATCH[3]}"; exec="${BASH_REMATCH[5]:-claude}"
     aufwand="${BASH_REMATCH[7]}"; model="${BASH_REMATCH[9]}"; nonce="${BASH_REMATCH[11]}"
@@ -231,7 +242,7 @@ process() {
     # erst archivieren, dann Report veroeffentlichen (Importer sieht nie Report + Brief in eingang/)
     mv -f "$EIN/$name" "$ERL/${ts}_$name"
     write_report "$AUS/$reportname" "$head" "$body"
-    printf '%s %s %s rc=%s dauer=%ss session=%s\n' "$(utcl)" "$name" "-" "REJECTED" 0 "-" >> "$LOGD/postbote.log"
+    printf '%s %s %s rc=%s dauer=%ss session=%s\n' "$(utcl)" "$name" "-" "REJECTED" 0 "-" >> "$LOGF"
     rm -f "$head" "$body"
     unclaim
     return 0
@@ -288,9 +299,9 @@ process() {
       # LLM-freier Auftrag: kein Executor-Environment (kein MCP-Token, kein OTEL), leeres Environment mit fester Liste; die Brief-Datei bleibt in eingang/ (W-3) und wird nur als Auftrag gelesen
       local -a renv=(PATH=/usr/local/bin:/usr/bin:/bin HOME="${HOME:-/srv/forge/home}" LANG=C.UTF-8 FORGE_BASE="$BASE" FORGE_RUN_BODY="$body") rv
       for rv in TMPDIR DOCKER_HOST DOCKER_CONFIG FORGE_PG_CONTAINER FORGE_RUN_ORDER_PSQL FORGE_GRAPH_DIR FORGE_RUN_REPOS_FILE FORGE_RUN_JOBS_DIR FORGE_RUN_GATES_FILE FORGE_RUN_WRITE_RESULT; do [ -n "${!rv:-}" ] && renv+=("$rv=${!rv}"); done
-      ( cd "$WORK" && exec timeout "${FORGE_RUN_MAX_SECONDS:-3900}" env -i "${renv[@]}" "$bin" "$EIN/$name" < /dev/null > "$json" 2> "$err" 9>&- 8>&- ) &
+      ( lane_close_fds; cd "$WORK" && exec timeout "${FORGE_RUN_MAX_SECONDS:-3900}" env -i "${renv[@]}" "$bin" "$EIN/$name" < /dev/null > "$json" 2> "$err" 9>&- 8>&- ) &
     else
-      ( forge_exec_env "$exec" "${ts}_$name" "${k%%-*}" "$k"; cd "$WORK" && exec timeout "${FORGE_MAX_SECONDS:-14400}" "$bin" "${args[@]}" < "$EIN/$name" > "$json" 2> "$err" 9>&- 8>&- ) &
+      ( lane_close_fds; forge_exec_env "$exec" "${ts}_$name" "${k%%-*}" "$k"; cd "$WORK" && exec timeout "${FORGE_MAX_SECONDS:-14400}" "$bin" "${args[@]}" < "$EIN/$name" > "$json" 2> "$err" 9>&- 8>&- ) &
     fi
     CHILD=$!
     unclaim      # Executor ist gestartet: Lock frei (forge-stop darf jetzt; der laufende Brief bleibt unberuehrt)
@@ -345,6 +356,7 @@ process() {
     [ -n "$nonce" ] && echo "- Nonce: $nonce"
     echo "- Art / Kuerzel: $art / $k"
     echo "Executor: $exec"
+    [ "$LANE" = 1 ] || echo "- Lane: $LANE"
     [ "$rejected" = 1 ] && echo "- Status: ABGELEHNT (Executor passt nicht zur gespeicherten Session)"
     [ -n "$aufwand" ] && echo "- Aufwand: $aufwand"
     if [ "$art" = RUN ]; then echo "- Modell: -"; else echo "- Modell: ${model:-(Standard)}"; fi
@@ -361,7 +373,7 @@ process() {
   # erst archivieren, dann Report veroeffentlichen (Run-ID = Archivname erledigt/<ts>_<name>)
   mv -f "$EIN/$name" "$ERL/${ts}_$name"
   write_report "$AUS/$reportname" "$head" "$body"
-  printf '%s %s %s rc=%s dauer=%ss session=%s\n' "$(utcl)" "$name" "${model:--}" "$rc" "$dur" "${newsid:-${sid:--}}" >> "$LOGD/postbote.log"
+  printf '%s %s %s rc=%s dauer=%ss session=%s\n' "$(utcl)" "$name" "${model:--}" "$rc" "$dur" "${newsid:-${sid:--}}" >> "$LOGF"
   rm -f "$head" "$body"
 }
 
@@ -372,24 +384,40 @@ while :; do
   if [ -e "$RESTART_FLAG" ]; then
     rid=$(sed -n 's/^requester=//p' "$RESTART_FLAG" 2>/dev/null | head -n1); rid="${rid:-unknown}"
     rm -f "$RESTART_FLAG"
-    printf '%s RESTART requested by %s\n' "$(utcl)" "$rid" >> "$LOGD/postbote.log"
+    printf '%s RESTART requested by %s\n' "$(utcl)" "$rid" >> "$LOGF"
     exit 0   # systemd (Restart=always) startet neu
   fi
   # Kill-Switch: nichts Neues starten, solange STOP existiert (auch Symlink/Verzeichnis zaehlt)
   if [ -e "$STOP_FILE" ] || [ -L "$STOP_FILE" ]; then
-    if [ "$PAUSED" = 0 ]; then printf '%s paused by STOP (%s)\n' "$(utcl)" "$STOP_FILE" >> "$LOGD/postbote.log"; PAUSED=1; fi
+    if [ "$PAUSED" = 0 ]; then printf '%s paused by STOP (%s)\n' "$(utcl)" "$STOP_FILE" >> "$LOGF"; PAUSED=1; fi
     [ "$ONCE" = 1 ] && break
     sleep "$POLL" 9>&- & wait $!
     continue
   fi
-  if [ "$PAUSED" = 1 ]; then printf '%s resumed (STOP removed)\n' "$(utcl)" >> "$LOGD/postbote.log"; PAUSED=0; fi
+  if [ "$PAUSED" = 1 ]; then printf '%s resumed (STOP removed)\n' "$(utcl)" >> "$LOGF"; PAUSED=0; fi
+  lane_arm
+  lane_route   # Briefe mit fremdem `.lane-<N>`-Tag in den Eingang der Ziel-Lane verschieben (nur wenn dieser existiert)
+  if ! lane_peer_ok; then   # nur Lane >= 2: wartet, bis Lane 1 ihre Sperren aktiv hat (Log PEER)
+    [ "$ONCE" = 1 ] && break
+    sleep "$POLL" 9>&- & wait $!
+    continue
+  fi
   if name=$(next_brief); then
     if [ -n "${FORGE_HOOK_AFTER_SELECT:-}" ] && [ -x "$FORGE_HOOK_AFTER_SELECT" ]; then "$FORGE_HOOK_AFTER_SELECT" "$name" 9>&-; fi
+    # Repo-/GO-Sperren VOR dem Dispatch-Lock (claim_lock in process): Warten haelt nie das Dispatch-Lock. 1 = Zeitgrenze (Brief bleibt, Log LOCKWAIT), 3 = SIGTERM beim Warten
+    lane_lock_for "$name"; lrc=$?
+    if [ "$lrc" != 0 ]; then
+      [ "$STOP" = 1 ] && break
+      [ "$ONCE" = 1 ] && break
+      sleep "$POLL" 9>&- & wait $!
+      continue
+    fi
     process "$name"; prc=$?
+    lane_release
     if [ "$prc" = 71 ] || [ "$prc" = 72 ]; then   # STOP bzw. Lock-Problem im gesperrten Startabschnitt: nichts gestartet
       if [ "$PAUSED" = 0 ]; then
-        if [ "$prc" = 71 ]; then printf '%s paused by STOP (%s)\n' "$(utcl)" "$STOP_FILE" >> "$LOGD/postbote.log"
-        else printf '%s control unavailable: dispatch lock/dir not usable, no brief started (%s)\n' "$(utcl)" "$LOCK_FILE" >> "$LOGD/postbote.log"; fi
+        if [ "$prc" = 71 ]; then printf '%s paused by STOP (%s)\n' "$(utcl)" "$STOP_FILE" >> "$LOGF"
+        else printf '%s control unavailable: dispatch lock/dir not usable, no brief started (%s)\n' "$(utcl)" "$LOCK_FILE" >> "$LOGF"; fi
         PAUSED=1
       fi
       [ "$ONCE" = 1 ] && break
