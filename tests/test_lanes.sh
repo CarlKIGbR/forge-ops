@@ -89,7 +89,7 @@ wait_for 15 started b1
 brief 2 BRIEF_b2.md b2 2 "repos: forge-ops"
 wait_for 40 ended b2; wait_for 20 ended b1
 check "verschiedene Repos: Laeufe ueberschneiden sich"       overlap b1 b2
-check "kein LOCKWAIT bei verschiedenen Repos"                bash -c "! grep -q LOCKWAIT '$(logf 1)' '$(logf 2)'"
+check "kein LOCKWAIT bei verschiedenen Repos"                bash -c "grep -q ' BRIEF_b2.md ' '$(logf 2)' && ! grep -q LOCKWAIT '$(logf 1)' '$(logf 2)'"
 stop_lane 1; stop_lane 2
 
 new_world w3c; mkdir -p "$POST/eingang-2"                    # Repo-Satz unbekannt (keine repos:-Zeile) => ALLE: serialisiert gegen jeden
@@ -170,7 +170,7 @@ start_lane 1; start_lane 2; wait_for 10 test -e "$POST/state/lane1-armed"; sleep
 check "zwei Heartbeat-Dateien (heartbeat / heartbeat-lane2)"  bash -c "[ -s '$POST/state/heartbeat' ] && [ -s '$POST/state/heartbeat-lane2' ]"
 stop_lane 2; h1a=$(cat "$POST/state/heartbeat"); h2a=$(cat "$POST/state/heartbeat-lane2"); sleep 3
 h1b=$(cat "$POST/state/heartbeat"); h2b=$(cat "$POST/state/heartbeat-lane2")
-check "Lane 2 gestoppt: ihr Heartbeat steht, der von Lane 1 laeuft" bash -c "[ '$h2a' = '$h2b' ] && [ '$h1a' != '$h1b' ]"
+check "Lane 2 gestoppt: ihr Heartbeat steht, der von Lane 1 laeuft" bash -c "[ -n '$h2a' ] && [ '$h2a' = '$h2b' ] && [ '$h1a' != '$h1b' ]"
 start_lane 2; sleep 2
 printf 'reason=test\nrequester=t\ntime=x\n' > "$POST/state/restart-requested-lane2"        # Flag nur fuer Lane 2
 wait_for 10 bash -c "! kill -0 ${LANE_PID[2]}"
@@ -203,7 +203,7 @@ new_world w6; mkdir -p "$POST/eingang-2"
 start_lane 1; start_lane 2; wait_for 10 test -e "$POST/state/lane1-armed"
 brief 1 BRIEF_x1.md x1 30 "repos: forge-core"; wait_for 15 started x1
 brief 2 BRIEF_x2.md x2 1 "repos: forge-core"; sleep 3
-check "Lane 2 wartet (Repo von Lane 1 belegt)"                 bash -c "! grep -q ' START x2 ' '$STUB_LOG'"
+check "Lane 2 wartet (Repo von Lane 1 belegt)"                 bash -c "! grep -q ' START x2 ' '$STUB_LOG' && grep -q 'LOCKWAIT lane=2 brief=BRIEF_x2.md' '$(logf 2)'"
 pkill -9 -P "${LANE_PID[1]}" 2>/dev/null; kill -9 "${LANE_PID[1]}" 2>/dev/null; pkill -9 -f "$T/claude" 2>/dev/null   # wie systemd bei KillMode=mixed + SIGKILL: Watcher UND Executor weg
 wait_for 20 started x2
 check "Lane 1 kill -9: Lane 2 bekommt die Sperre und laeuft"   started x2
@@ -217,7 +217,7 @@ brief 1 BRIEF_x4.md x4 8 "repos: forge-core"; wait_for 15 started x4
 brief 2 BRIEF_x5.md x5 1 "repos: forge-ops"; wait_for 20 ended x5      # parallel, Lane 2 frei
 pkill -9 -P "${LANE_PID[2]}" 2>/dev/null; kill -9 "${LANE_PID[2]}" 2>/dev/null; LANE_PID[2]=""
 wait_for 20 ended x4
-check "Lane 2 kill -9: Lane 1 beendet ihren Lauf regulaer"     ended x4
+check "Lane 2 kill -9: Lane 1 beendet ihren Lauf regulaer (Lane 2 hatte x5 gefahren)" bash -c "grep -q ' START x5 2$' '$STUB_LOG' && grep -q ' END x4 1$' '$STUB_LOG'"
 brief 1 BRIEF_x6.md x6 1 "repos: forge-core"; wait_for 15 ended x6
 check "Lane 1 laeuft nach Absturz von Lane 2 weiter (x6)"      ended x6
 start_lane 2; sleep 2
@@ -262,11 +262,11 @@ brief 2 BRIEF_z2.md z2 1 "repos: forge-core"
 wait_for 15 grep -q TIMEOUT "$(logf 2)"
 check "Zeitgrenze: TIMEOUT geloggt, Brief bleibt in eingang-2/" bash -c "grep -q 'LOCKWAIT lane=2 brief=BRIEF_z2.md lock=all.*TIMEOUT\|LOCKWAIT lane=2 brief=BRIEF_z2.md lock=repo-forge-core.*TIMEOUT' '$(logf 2)' && [ -e '$POST/eingang-2/BRIEF_z2.md' ]"
 FORGE_LOCK_TIMEOUT=2 bash "$OPSBIN/forge-stop" "test" >/dev/null 2>&1; rcs=$?
-check "forge-stop gelingt waehrend Lane 2 wartet (Dispatch-Lock frei)" test "$rcs" = 0
+check "forge-stop gelingt waehrend Lane 2 wartet (Dispatch-Lock frei)" bash -c "[ '$rcs' = 0 ] && grep -q 'LOCKWAIT lane=2 brief=BRIEF_z2.md' '$(logf 2)'"
 rm -f "$POST/control/STOP"
 unset FORGE_LANE_LOCK_WAIT
 stop_lane 2
-check "SIGTERM waehrend des Wartens: Lane 2 beendet sich, Brief bleibt" bash -c "[ -e '$POST/eingang-2/BRIEF_z2.md' ]"
+check "SIGTERM waehrend des Wartens: Lane 2 beendet sich, Brief bleibt" bash -c "[ -e '$POST/eingang-2/BRIEF_z2.md' ] && grep -q 'LOCKWAIT lane=2 brief=BRIEF_z2.md' '$(logf 2)'"
 wait_for 20 ended z1
 stop_lane 1
 
@@ -276,7 +276,7 @@ brief 1 BRIEF_s1.md s1 8 "repos: forge-core"; wait_for 15 started s1
 brief 2 BRIEF_s2.md s2 1 "repos: forge-core"; sleep 3
 kill -TERM "${LANE_PID[2]}"; wait_for 10 bash -c "! kill -0 ${LANE_PID[2]}"
 check "SIGTERM beim Warten: Lane 2 endet, 'aborted (shutdown)' geloggt" bash -c "! kill -0 ${LANE_PID[2]} 2>/dev/null && grep -q 'aborted (shutdown)' '$(logf 2)'"
-check "Brief unangetastet in eingang-2/, nie gestartet"        bash -c "[ -e '$POST/eingang-2/BRIEF_s2.md' ] && ! grep -q ' START s2 ' '$STUB_LOG'"
+check "Brief unangetastet in eingang-2/, nie gestartet"        bash -c "[ -e '$POST/eingang-2/BRIEF_s2.md' ] && ! grep -q ' START s2 ' '$STUB_LOG' && grep -q 'LOCKWAIT lane=2 brief=BRIEF_s2.md' '$(logf 2)'"
 LANE_PID[2]=""; stop_lane 1
 fi
 
@@ -313,6 +313,22 @@ brief 2 BRIEF_rb.md rb 2 "repos: forge-core"
 wait_for 40 ended rb; wait_for 20 ended ra
 check "Re-Aktivierung: Lane 2 startet erst nach dem sperrfreien Lauf (kein Overlap, gleiches Repo)" after ra rb
 check "Lane 2 loggt PEER waehrend des sperrfreien Laufs"         grep -q 'PEER lane=2 waiting' "$(logf 2)"
+stop_lane 1; stop_lane 2
+# Enge Luecke: eingang-2/ verschwindet NACH dem Schleifenkopf, aber VOR dem Start des Briefs (Hook nach der Auswahl) - lane_lock_for muss den Marker selbst loeschen
+new_world w10c; mkdir -p "$POST/eingang-2"
+cat > "$T/rm_eingang2.sh" <<H
+#!/usr/bin/env bash
+[ "\$1" = BRIEF_hc1.md ] && rmdir "$POST/eingang-2"
+exit 0
+H
+chmod +x "$T/rm_eingang2.sh"
+FORGE_HOOK_AFTER_SELECT="$T/rm_eingang2.sh" start_lane 1; wait_for 10 test -s "$POST/state/lane1-armed"
+brief 1 BRIEF_hc1.md hc1 8 "repos: forge-core"; wait_for 15 started hc1
+check "Hook entfernte eingang-2/ nach dem Schleifenkopf; Marker trotzdem weg" bash -c "[ ! -d '$POST/eingang-2' ] && [ ! -e '$POST/state/lane1-armed' ]"
+mkdir -p "$POST/eingang-2"; start_lane 2
+brief 2 BRIEF_hc2.md hc2 2 "repos: forge-core"
+wait_for 40 ended hc2; wait_for 20 ended hc1
+check "Re-Aktivierung im engen Fenster: Lane 2 startet erst nach dem sperrfreien Lauf" after hc1 hc2
 stop_lane 1; stop_lane 2
 # Marker-Hygiene: ein Marker mit lebender PID, aber falscher Startzeit (PID-Wiederverwendung) zaehlt nicht
 new_world w10b; mkdir -p "$POST/eingang-2"

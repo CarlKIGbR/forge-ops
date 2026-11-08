@@ -25,6 +25,12 @@ mutant "kein Peer-Handshake"             "7"   forge-lanes.sh 's/^lane_peer_ok\(
 mutant "Warten ohne Zeitgrenze"          "8"   forge-lanes.sh 's/\[ "\$waited" -ge "\$dl" \]/false/'
 mutant "kein Abbruch bei SIGTERM"        "8"   forge-lanes.sh 's/\[ "\$\{STOP:-0\}" = 1 \]/false/'
 mutant "Routing aus"                     "1"   forge-lanes.sh 's/^lane_route\(\) \{/lane_route() { return 0;/'
-mutant "Lane 1 sperrt immer (nicht inert)" "1 9" forge-lanes.sh 's/\[ "\$LANE" = 1 \] && ! lane_two_enabled && return 0/:/'
+mutant "Lane 1 sperrt immer (nicht inert)" "1 9" forge-lanes.sh 's/if \[ "\$LANE" = 1 \] && ! lane_two_enabled; then   # Lane 1 ohne/if false; then   # Lane 1 ohne/'
+mutant "M-1: Marker wird nie geloescht"  "10"  forge-lanes.sh 's/\[ -e "\$STATE\/lane1-armed" \] && rm -f "\$STATE\/lane1-armed"/:/'
+mutant "M-1: Marker nur vor dem Lauf nicht geloescht (lane_lock_for)" "10" forge-lanes.sh '/ERST den Marker/{n;s/.*/    :/}'
+mutant "M-1: Marker ohne Startzeit-Pruefung" "10" forge-lanes.sh 's/\[ "\$\(lane_starttime "\$pid"\)" = "\$st" \]/true/'
+mutant "m-1: .lane-1 ohne eingang-2 akzeptiert" "1" forge-lanes.sh 's/^  if \[ "\$LANE" = 1 \] && ! lane_two_enabled; then printf .*return 0; fi$/  :/'
+mutant "m-2: Lane-Variable im Executor"  "11"  forge-postbote.sh 's/^unset FORGE_LANE.*/export FORGE_LANE="$LANE"/'
+mutant "m-2: Neustart nur fuer eine Lane" "5 11" forge-request-restart.sh 's/\[ -d "\$BASE\/post\/eingang-2" \]/false/'
 echo "SUMMARY: $caught erkannt, $missed nicht erkannt"
 [ "$missed" = 0 ]

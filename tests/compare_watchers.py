@@ -15,6 +15,11 @@ BASE_REV = sys.argv[1] if len(sys.argv) > 1 else "bd6a8af"
 ARTS = ("BRIEF", "WEISUNG", "NACHFORDERUNG", "GO", "PING")
 CASES = [  # (suffix, kuerzel, session-datei vorab (executor) | None)
     ("", "forge-c1", None),
+    (".lane-1", "forge-c7", None),                            # Lane-Tag ohne eingang-2/: wie master (ABGELEHNT)
+    (".lane-2", "forge-c8", None),
+    (".lane-3.n-0a1b2c3d", "forge-c9", None),
+    (".modell-foo.lane-1", "forge-c10", None),                # Modell-ID, die auf .lane-1 endet: wie master gueltig
+    (".exec-codex.lane-1.n-0a1b2c3d", "forge-c11", None),
     (".exec-codex.aufwand-high.modell-gpt-6-luna.n-0a1b2c3d", "forge-c2", None),
     (".fortsetzung.exec-claude", "forge-c3", "claude"),
     (".fortsetzung.exec-codex", "forge-c4", "codex"),
