@@ -177,6 +177,7 @@ wait_for 10 bash -c "! kill -0 ${LANE_PID[2]}"
 check "Lane-2-Flag: Lane 2 beendet sich (Exit 0) und loggt RESTART in IHREM Log" bash -c "grep -q 'RESTART requested' '$(logf 2)' && ! grep -q RESTART '$(logf 1)'"
 check "Lane 1 laeuft weiter"                                   kill -0 "${LANE_PID[1]}"
 start_lane 2; sleep 2
+rm -f "$POST/state"/restart-requested*
 bash "$OPSBIN/forge-request-restart.sh" "beide Lanes" >/dev/null
 check "forge-request-restart.sh mit eingang-2/: BEIDE Flags"   bash -c "[ -e '$POST/state/restart-requested' ] && [ -e '$POST/state/restart-requested-lane2' ]"
 wait_for 10 bash -c "! kill -0 ${LANE_PID[1]} && ! kill -0 ${LANE_PID[2]}"
@@ -304,9 +305,10 @@ if sec 10; then
 echo "# 10 Re-Aktivierung nach Rollback: veralteter Marker state/lane1-armed darf Lane 2 nie starten lassen (Verify M-1)"
 new_world w10; mkdir -p "$POST/eingang-2"
 start_lane 1; wait_for 10 test -s "$POST/state/lane1-armed"
+check "Lane 1 armt sich, wenn eingang-2/ existiert (Marker <PID> <Startzeit>)" bash -c "grep -Eq '^[0-9]+ [0-9]+$' '$POST/state/lane1-armed'"
 rmdir "$POST/eingang-2"                                          # Rollback OHNE den Marker zu loeschen
 sleep 2
-check "Lane 1 raeumt ihren Marker selbst weg, sobald eingang-2/ fehlt" test ! -e "$POST/state/lane1-armed"
+check "Lane 1 raeumt ihren Marker selbst weg, sobald eingang-2/ fehlt" bash -c "grep -q 'lane 1 armed' '$(logf 1)' && [ ! -e '$POST/state/lane1-armed' ]"
 brief 1 BRIEF_ra.md ra 8 "repos: forge-core"; wait_for 15 started ra     # sperrfreier Lauf (eingang-2/ fehlt)
 mkdir -p "$POST/eingang-2"; start_lane 2                        # Re-Aktivierung mitten im sperrfreien Lauf
 brief 2 BRIEF_rb.md rb 2 "repos: forge-core"
@@ -324,7 +326,7 @@ H
 chmod +x "$T/rm_eingang2.sh"
 FORGE_HOOK_AFTER_SELECT="$T/rm_eingang2.sh" start_lane 1; wait_for 10 test -s "$POST/state/lane1-armed"
 brief 1 BRIEF_hc1.md hc1 8 "repos: forge-core"; wait_for 15 started hc1
-check "Hook entfernte eingang-2/ nach dem Schleifenkopf; Marker trotzdem weg" bash -c "[ ! -d '$POST/eingang-2' ] && [ ! -e '$POST/state/lane1-armed' ]"
+check "Hook entfernte eingang-2/ nach dem Schleifenkopf; Marker trotzdem weg" bash -c "grep -q 'lane 1 armed' '$(logf 1)' && [ ! -d '$POST/eingang-2' ] && [ ! -e '$POST/state/lane1-armed' ]"
 mkdir -p "$POST/eingang-2"; start_lane 2
 brief 2 BRIEF_hc2.md hc2 2 "repos: forge-core"
 wait_for 40 ended hc2; wait_for 20 ended hc1
